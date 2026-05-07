@@ -58,6 +58,9 @@ uart:
     stop_bits: 1
     parity: NONE
     data_bits: 8
+    # Note: flow_control_pin not set. GPIO19 (ENABLE_PIN) controls the RS485
+    # transceiver enable, not the DE/RE direction pin. The T-CAN485 appears to
+    # handle half-duplex direction automatically at the hardware level.
 
 modbus:
   - uart_id: uart_modbus_inverter_1
@@ -68,6 +71,7 @@ modbus_controller:
     update_interval: 15s
     modbus_id: modbus_inverter_1
     id: inverter_1
+    command_throttle: 50ms
 
 # Set pins required for LilyGo T-CAN485 board
 output:
@@ -109,12 +113,15 @@ sensor:
     value_type: U_WORD
     internal: true
 
+  # Raw register 153 mirror - internal only, used by ac_first switch lambda
+  # Using sensor (not number) so HA cannot accidentally write to it
   - platform: modbus_controller
     modbus_controller_id: inverter_1
-    name: "Hold 153"
+    name: "reg153_raw"
     id: reg153
     register_type: holding
     address: 153
+    internal: true
 
   - platform: modbus_controller
     modbus_controller_id: inverter_1
@@ -135,7 +142,6 @@ sensor:
     id: bat_soc
     address: 5
     register_type: read
-    register_count: 1
     value_type: U_WORD
     unit_of_measurement: "%"
     device_class: battery
@@ -144,7 +150,6 @@ sensor:
       - lambda: |-
           // reg 5 appears packed as 0xHHLL (HH=other, LL=SOC)
           int soc = (int(x) & 0xFF);
-          if (soc < 0) soc = 0;
           if (soc > 100) soc = 100;
           return soc;
 
@@ -171,8 +176,8 @@ sensor:
     name: "Grid Voltage"
     id: grid_volt
     register_type: read
-    register_count: 4
     address: 12
+    register_count: 4   # spans 12-15 to batch with adjacent sensors in one FC04 request
     unit_of_measurement: "V"
     accuracy_decimals: 2
     value_type: U_WORD
@@ -184,8 +189,8 @@ sensor:
     name: "AC Charge Power"
     id: prec
     register_type: read
-    register_count: 6
     address: 17
+    register_count: 6   # spans 17-22 to batch with adjacent sensors in one FC04 request
     unit_of_measurement: "W"
     value_type: U_WORD
 
@@ -194,8 +199,8 @@ sensor:
     name: "EPS Power"
     id: eps_power
     register_type: read
-    register_count: 2
     address: 24
+    register_count: 2   # spans 24-25 to batch with adjacent sensors in one FC04 request
     unit_of_measurement: "W"
     value_type: U_WORD
 
@@ -205,7 +210,7 @@ sensor:
     id: pinv
     register_type: read
     address: 27
-    register_count: 49
+    register_count: 49  # spans 27-75 to batch temp_battery (67) in one FC04 request
     unit_of_measurement: "W"
     value_type: U_WORD
 
@@ -444,8 +449,7 @@ text_sensor:
     id: state
     register_type: read
     address: 0
-    register_count: 3
-    bitmask: 0x1
+    register_count: 3   # spans 0-2 to batch adjacent sensors in one FC04 request
     raw_encode: HEXBYTES
     lambda: |-
       auto call = id(led).turn_on();
@@ -467,8 +471,10 @@ text_sensor:
       if (x == "0011") {
         call.set_rgb(1, 0, 0);
         call.perform();
-        // Turn on AC First to recover from SOC cutoff
-        id(ac_first).turn_on();
+        // Only trigger ac_first on transition into SOC Cut Off, not every poll
+        if (!id(ac_first).state) {
+          id(ac_first).turn_on();
+        }
         return std::string("SOC Cut Off");
       }
       if (x == "00c0") {
@@ -532,6 +538,7 @@ button:
             inverter_1->queue_command(cmd_hd);
             inverter_1->queue_command(cmd_sm);
 
+  # Writes 23:59 to holding reg 69 (charge stop time) to effectively disable the charge time window
   - platform: template
     id: set_chargestop_time
     name: "Set Charge Time"
