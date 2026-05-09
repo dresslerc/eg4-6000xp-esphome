@@ -8,7 +8,7 @@ esphome:
             brightness: 20%
             red: 100%
             green: 100%
-            blue: 1.0
+            blue: 100%
 
 esp32:
   board: esp32dev
@@ -20,6 +20,7 @@ logger:
     modbus: none
 
 api:
+  reboot_timeout: 0s
   encryption:
     key: "sk3Mj3R0oEgR8iFS0TcuLyqFN8pv1+CZ4I6eZ3NmBNA="
 
@@ -45,7 +46,7 @@ light:
   - platform: esp32_rmt_led_strip
     rgb_order: GRB
     pin: GPIO04
-    num_leds: 30
+    num_leds: 1
     chipset: ws2812
     id: led
     internal: true
@@ -72,6 +73,7 @@ modbus_controller:
     modbus_id: modbus_inverter_1
     id: inverter_1
     command_throttle: 50ms
+    offline_skip_updates: 10
 
 # Set pins required for LilyGo T-CAN485 board
 output:
@@ -133,6 +135,7 @@ sensor:
     unit_of_measurement: "V"
     accuracy_decimals: 2
     value_type: U_WORD
+    state_class: measurement
     filters:
       - multiply: 0.1
 
@@ -161,6 +164,7 @@ sensor:
     address: 10
     unit_of_measurement: "W"
     value_type: U_WORD
+    state_class: measurement
 
   - platform: modbus_controller
     modbus_controller_id: inverter_1
@@ -170,6 +174,7 @@ sensor:
     address: 11
     unit_of_measurement: "W"
     value_type: U_WORD
+    state_class: measurement
 
   - platform: modbus_controller
     modbus_controller_id: inverter_1
@@ -181,6 +186,7 @@ sensor:
     unit_of_measurement: "V"
     accuracy_decimals: 2
     value_type: U_WORD
+    state_class: measurement
     filters:
       - multiply: 0.1
 
@@ -193,6 +199,7 @@ sensor:
     register_count: 6   # spans 17-22 to batch with adjacent sensors in one FC04 request
     unit_of_measurement: "W"
     value_type: U_WORD
+    state_class: measurement
 
   - platform: modbus_controller
     modbus_controller_id: inverter_1
@@ -203,6 +210,7 @@ sensor:
     register_count: 2   # spans 24-25 to batch with adjacent sensors in one FC04 request
     unit_of_measurement: "W"
     value_type: U_WORD
+    state_class: measurement
 
   - platform: modbus_controller
     modbus_controller_id: inverter_1
@@ -213,6 +221,7 @@ sensor:
     register_count: 49  # spans 27-75 to batch temp_battery (67) in one FC04 request
     unit_of_measurement: "W"
     value_type: U_WORD
+    state_class: measurement
 
   - platform: modbus_controller
     modbus_controller_id: inverter_1
@@ -234,6 +243,7 @@ sensor:
     address: 153
     unit_of_measurement: "W"
     value_type: U_WORD
+    state_class: measurement
 
 select:
 
@@ -262,6 +272,7 @@ select:
       if (bits == 10) return std::string("According To SOC/Time");
       return {};
     write_lambda: |-
+      if (isnan(id(reg120).state)) return {};
       uint16_t current = (uint16_t) id(reg120).state;
       uint16_t updated = (current & ~0x0E) | (value & 0x0E);
       ESP_LOGD("ac_charge_based_on", "reg120 current=%d, option_value=%d, writing=%d", current, value, updated);
@@ -294,8 +305,10 @@ select:
       if (bits == 0)  return std::string("According To Voltage");
       if (bits == 16) return std::string("According To SOC");
       if (bits == 32) return std::string("According To Both");
-      return {};
+      // bits == 48 (0x30): both bits set — invalid inverter state, treat as voltage
+      return std::string("According To Voltage");
     write_lambda: |-
+      if (isnan(id(reg120).state)) return {};
       uint16_t current = (uint16_t) id(reg120).state;
       uint16_t updated = (current & ~0x30) | (value & 0x30);
       ESP_LOGD("discharge_control", "reg120 current=%d, option_value=%d, writing=%d", current, value, updated);
@@ -358,6 +371,7 @@ number:
     address: 105
     skip_updates: 6
     value_type: U_WORD
+    entity_category: config
     unit_of_measurement: "%"
     min_value: 1
     max_value: 90
@@ -371,6 +385,7 @@ number:
     address: 125
     skip_updates: 6
     value_type: U_WORD
+    entity_category: config
     unit_of_measurement: "%"
     min_value: 1
     max_value: 90
@@ -384,6 +399,7 @@ number:
     address: 160
     skip_updates: 6
     value_type: U_WORD
+    entity_category: config
     unit_of_measurement: "%"
     min_value: 1
     max_value: 90
@@ -397,6 +413,7 @@ number:
     address: 161
     skip_updates: 6
     value_type: U_WORD
+    entity_category: config
     unit_of_measurement: "%"
     min_value: 20
     max_value: 100
@@ -410,6 +427,7 @@ number:
     address: 168
     skip_updates: 6
     value_type: U_WORD
+    entity_category: config
     unit_of_measurement: "A"
     min_value: 0
     max_value: 105
@@ -423,6 +441,7 @@ number:
     address: 220
     skip_updates: 6
     value_type: U_WORD
+    entity_category: config
     unit_of_measurement: "%"
     min_value: 0
     max_value: 95
@@ -436,6 +455,7 @@ number:
     address: 221
     skip_updates: 6
     value_type: U_WORD
+    entity_category: config
     unit_of_measurement: "%"
     min_value: 0
     max_value: 100
@@ -515,13 +535,14 @@ button:
     on_press:
       then:
         - lambda: |-
-            auto time = id(ha_time).now();
-            uint8_t month           = time.month;
-            uint8_t yearLastTwoDigits = time.year % 100;
-            uint8_t hour            = time.hour;
-            uint8_t day             = time.day_of_month;
-            uint8_t second          = time.second;
-            uint8_t minute          = time.minute;
+            auto now = id(ha_time).now();
+            if (!now.is_valid()) return;
+            uint8_t month           = now.month;
+            uint8_t yearLastTwoDigits = now.year % 100;
+            uint8_t hour            = now.hour;
+            uint8_t day             = now.day_of_month;
+            uint8_t second          = now.second;
+            uint8_t minute          = now.minute;
 
             uint16_t monthYear    = (month  << 8) | yearLastTwoDigits;
             uint16_t hourDay      = (hour   << 8) | day;
