@@ -1,6 +1,8 @@
 esphome:
   name: 6000xp
   friendly_name: 6000xp
+  # This configuration uses the post-2026.7 Modbus controller queue API.
+  min_version: 2026.7.4
   on_boot:
       then:
         - light.turn_on:
@@ -17,7 +19,9 @@ esp32:
 
 logger:
   logs:
-    modbus: none
+    # Keep production logs quiet while retaining timeout/CRC diagnostics.
+    modbus: WARN
+    modbus_controller: WARN
 
 api:
   reboot_timeout: 0s
@@ -27,11 +31,6 @@ api:
 ota:
   - platform: esphome
     password: "99d1f9ce4b7cb8d9f9da8a2518f0c5a1"
-
-web_server:
-  port: 80
-  version: 3
-  local: true
 
 wifi:
   networks:
@@ -66,6 +65,11 @@ uart:
 modbus:
   - uart_id: uart_modbus_inverter_1
     id: modbus_inverter_1
+    # ESPHome 2026.7 increased these defaults to 2000ms/600ms. The inverter
+    # normally answers much faster; explicit conservative values keep writes
+    # from sitting behind the polling queue for several seconds.
+    send_wait_time: 500ms
+    turnaround_time: 200ms
 
 modbus_controller:
   - address: 1
@@ -73,7 +77,192 @@ modbus_controller:
     modbus_id: modbus_inverter_1
     id: inverter_1
     command_throttle: 50ms
-    offline_skip_updates: 10
+    max_cmd_retries: 2
+    offline_skip_updates: 2
+    on_offline:
+      then:
+        - lambda: |-
+            ESP_LOGW("inverter", "Modbus offline after FC%d register %d",
+                     function_code, address);
+            id(inverter_modbus_online).publish_state(false);
+            id(inverter_modbus_status).publish_state(
+              str_sprintf("Offline: FC%d register %d", function_code, address));
+
+            // Queued commands are not removed when ESPHome declares the
+            // controller offline. Preserve their pending generations so a
+            // user command already in the queue can still finish and verify
+            // after recovery; only reject additional writes meanwhile.
+            id(reg120_shadow_valid) = false;
+            id(ac_first_schedule_valid) = false;
+
+            id(ac_charge_time_valid).fill(false);
+
+            id(config_valid).fill(false);
+
+            // Make writable settings visibly unavailable instead of leaving
+            // optimistic values displayed while the inverter is unreachable.
+            id(on_grid_eod_soc).publish_state(NAN);
+            id(discharge_cutoff_soc).publish_state(NAN);
+            id(ac_charge_start).publish_state(NAN);
+            id(ac_charge_stop).publish_state(NAN);
+            id(ac_charge_cur).publish_state(NAN);
+            id(ac_couple_start_soc).publish_state(NAN);
+            id(ac_couple_end_soc).publish_state(NAN);
+            // SOC drives an automation, so never let a pre-outage value be
+            // treated as current after communication is lost.
+            id(vbat).publish_state(NAN);
+            id(bat_soc).publish_state(NAN);
+    on_online:
+      then:
+        - lambda: |-
+            ESP_LOGI("inverter", "Modbus online; scheduling authoritative state refresh");
+            id(inverter_modbus_online).publish_state(true);
+            id(inverter_modbus_status).publish_state("Online - refreshing state");
+        - script.execute: refresh_inverter_state
+
+# Register 120 contains multiple independent controls. All writers use this
+# shared shadow and one serialized script so a second change cannot overwrite
+# or be swallowed by a first write that is still in flight.
+globals:
+  - id: reg120_shadow
+    type: uint16_t
+    restore_value: no
+    initial_value: '0'
+  - id: reg120_shadow_valid
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: reg120_write_pending
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: reg120_pending_since
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: reg120_write_generation
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: reg120_verification_dispatch
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: ac_first_write_pending
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: ac_first_pending_since
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: ac_first_write_generation
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: ac_first_schedule_valid
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: ac_first_desired_on
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  - id: ac_first_current_start
+    type: uint16_t
+    restore_value: no
+    initial_value: '0'
+  - id: ac_first_current_end
+    type: uint16_t
+    restore_value: no
+    initial_value: '0'
+  - id: ac_first_desired_start
+    type: uint16_t
+    restore_value: yes
+    initial_value: '0'
+  - id: ac_first_desired_end
+    type: uint16_t
+    restore_value: yes
+    initial_value: '0'
+  - id: ac_first_saved_start
+    type: uint16_t
+    restore_value: yes
+    initial_value: '0'
+  - id: ac_first_saved_end
+    type: uint16_t
+    restore_value: yes
+    initial_value: '0'
+  - id: ac_first_restore_available
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  - id: ac_first_retry_count
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+  - id: ac_first_verification_dispatch
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: ac_first_pair_fault
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  - id: ac_first_custom_candidate_start
+    type: uint16_t
+    restore_value: no
+    initial_value: '0'
+  - id: ac_first_custom_candidate_end
+    type: uint16_t
+    restore_value: no
+    initial_value: '0'
+  - id: ac_first_custom_stable_samples
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+  # Seven writable scalar settings use one verified queue. Arrays are indexed
+  # as 105, 125, 160, 161, 168, 220 and 221 respectively.
+  - id: config_shadow
+    type: 'std::array<uint16_t, 7>'
+    restore_value: no
+    initial_value: '{0, 0, 0, 0, 0, 0, 0}'
+  - id: config_valid
+    type: 'std::array<bool, 7>'
+    restore_value: no
+    initial_value: '{false, false, false, false, false, false, false}'
+  - id: config_write_pending
+    type: 'std::array<bool, 7>'
+    restore_value: no
+    initial_value: '{false, false, false, false, false, false, false}'
+  - id: config_pending_since
+    type: 'std::array<uint32_t, 7>'
+    restore_value: no
+    initial_value: '{0, 0, 0, 0, 0, 0, 0}'
+  - id: config_write_generation
+    type: 'std::array<uint32_t, 7>'
+    restore_value: no
+    initial_value: '{0, 0, 0, 0, 0, 0, 0}'
+  # AC Charge window 1 is a pair: holding 68=start, 69=end.
+  - id: ac_charge_time_shadow
+    type: 'std::array<uint16_t, 2>'
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: ac_charge_time_valid
+    type: 'std::array<bool, 2>'
+    restore_value: no
+    initial_value: '{false, false}'
+  - id: ac_charge_time_write_pending
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: ac_charge_time_pending_since
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: ac_charge_time_write_generation
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
 
 # Set pins required for LilyGo T-CAN485 board
 output:
@@ -102,9 +291,38 @@ binary_sensor:
     skip_updates: 20
     bitmask: 0x02
 
+  - platform: template
+    name: "Inverter Modbus Online"
+    id: inverter_modbus_online
+    entity_category: diagnostic
+    device_class: connectivity
+
+  - platform: template
+    name: "Inverter Settings Write Pending"
+    id: inverter_settings_write_pending
+    entity_category: diagnostic
+    icon: "mdi:progress-clock"
+    lambda: |-
+      if (id(reg120_write_pending) || id(ac_first_write_pending) ||
+          id(ac_charge_time_write_pending)) return true;
+      for (bool pending : id(config_write_pending)) {
+        if (pending) return true;
+      }
+      return false;
+
 sensor:
 
-  # Raw register 120 mirror - internal only, used by select write_lambdas
+  - platform: template
+    name: "Inverter Modbus Queue Length"
+    id: inverter_modbus_queue_length
+    entity_category: diagnostic
+    icon: "mdi:format-list-numbered"
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      return (float) inverter_1->get_command_queue_length();
+
+  # Raw register 120 mirror and confirmed source for the shared local shadow
   # Using sensor (not number) so HA cannot accidentally write to it
   - platform: modbus_controller
     modbus_controller_id: inverter_1
@@ -114,16 +332,498 @@ sensor:
     address: 120
     value_type: U_WORD
     internal: true
+    on_value:
+      then:
+        - lambda: |-
+            if (isnan(x)) return;
 
-  # Raw register 153 mirror - internal only, used by ac_first switch lambda
-  # Using sensor (not number) so HA cannot accidentally write to it
+            // Ignore a stale periodic read while a newer desired value is in
+            // flight. If communication failed, accept the inverter as source
+            // of truth again after the pending-write grace period.
+            const uint32_t pending_age = millis() - id(reg120_pending_since);
+            if (id(reg120_write_pending) &&
+                (id(reg120_pending_since) == 0 || pending_age < 30000)) return;
+
+            const uint16_t confirmed = (uint16_t) x;
+            id(reg120_write_pending) = false;
+            id(reg120_shadow) = confirmed;
+            id(reg120_shadow_valid) = true;
+            id(inverter_modbus_online).publish_state(true);
+            id(inverter_modbus_status).publish_state("Online");
+
+            switch (confirmed & 0x0E) {
+              case 0x00: id(ac_charge_based_on).publish_state("Disabled"); break;
+              case 0x02: id(ac_charge_based_on).publish_state("According To Time"); break;
+              case 0x04: id(ac_charge_based_on).publish_state("According To Voltage"); break;
+              case 0x06: id(ac_charge_based_on).publish_state("According To SOC"); break;
+              case 0x08: id(ac_charge_based_on).publish_state("According To Voltage/Time"); break;
+              case 0x0A: id(ac_charge_based_on).publish_state("According To SOC/Time"); break;
+              default:
+                ESP_LOGW("reg120", "Unsupported AC charge type bits 0x%02X", confirmed & 0x0E);
+                break;
+            }
+
+            switch (confirmed & 0x30) {
+              case 0x00: id(discharge_control).publish_state("According To Voltage"); break;
+              case 0x10: id(discharge_control).publish_state("According To SOC"); break;
+              case 0x20: id(discharge_control).publish_state("According To Both"); break;
+              default:
+                ESP_LOGW("reg120", "Unsupported discharge control bits 0x%02X", confirmed & 0x30);
+                break;
+            }
+
+            // Verification of our own failed high-SOC disable must not create
+            // a tight write/read retry loop. Ordinary/authoritative reads do
+            // re-run the level policy so an external mode change is caught.
+            if (!id(reg120_verification_dispatch)) {
+              id(enforce_high_soc_charge_policy).execute();
+            }
+
+  # Read-only mirrors for writable settings. Home Assistant writes the
+  # template-number entities below; these sensors are the authoritative
+  # periodic/readback path from the inverter.
   - platform: modbus_controller
     modbus_controller_id: inverter_1
-    name: "reg153_raw"
-    id: reg153
-    register_type: holding
-    address: 153
+    id: on_grid_eod_soc_raw
+    name: "on_grid_eod_soc_raw"
     internal: true
+    register_type: holding
+    address: 105
+    skip_updates: 2
+    value_type: U_WORD
+    on_value:
+      then:
+        - lambda: |-
+            if (isnan(x)) return;
+            const uint8_t slot = 0;
+            if (id(config_write_pending)[slot] &&
+                (id(config_pending_since)[slot] == 0 ||
+                 millis() - id(config_pending_since)[slot] < 30000)) return;
+            id(config_write_pending)[slot] = false;
+            const uint16_t value = uint16_t(x);
+            if (value > 90) {
+              ESP_LOGW("settings", "Rejected invalid register 105 value %u", value);
+              id(config_valid)[slot] = false;
+              id(on_grid_eod_soc).publish_state(NAN);
+              return;
+            }
+            id(config_shadow)[slot] = value;
+            id(config_valid)[slot] = true;
+            id(on_grid_eod_soc).update();
+            id(inverter_modbus_online).publish_state(true);
+            id(inverter_modbus_status).publish_state("Online");
+
+  - platform: modbus_controller
+    modbus_controller_id: inverter_1
+    id: discharge_cutoff_soc_raw
+    name: "discharge_cutoff_soc_raw"
+    internal: true
+    register_type: holding
+    address: 125
+    skip_updates: 2
+    value_type: U_WORD
+    on_value:
+      then:
+        - lambda: |-
+            if (isnan(x)) return;
+            const uint8_t slot = 1;
+            if (id(config_write_pending)[slot] &&
+                (id(config_pending_since)[slot] == 0 ||
+                 millis() - id(config_pending_since)[slot] < 30000)) return;
+            id(config_write_pending)[slot] = false;
+            const uint16_t value = uint16_t(x);
+            if (value > 90) {
+              ESP_LOGW("settings", "Rejected invalid register 125 value %u", value);
+              id(config_valid)[slot] = false;
+              id(discharge_cutoff_soc).publish_state(NAN);
+              return;
+            }
+            id(config_shadow)[slot] = value;
+            id(config_valid)[slot] = true;
+            id(discharge_cutoff_soc).update();
+            id(inverter_modbus_online).publish_state(true);
+            id(inverter_modbus_status).publish_state("Online");
+
+  - platform: modbus_controller
+    modbus_controller_id: inverter_1
+    id: ac_charge_start_raw
+    name: "ac_charge_start_raw"
+    internal: true
+    register_type: holding
+    address: 160
+    skip_updates: 2
+    value_type: U_WORD
+    on_value:
+      then:
+        - lambda: |-
+            if (isnan(x)) return;
+            const uint8_t slot = 2;
+            if (id(config_write_pending)[slot] &&
+                (id(config_pending_since)[slot] == 0 ||
+                 millis() - id(config_pending_since)[slot] < 30000)) return;
+            id(config_write_pending)[slot] = false;
+            const uint16_t value = uint16_t(x);
+            if (value < 1 || value > 90) {
+              ESP_LOGW("settings", "Rejected invalid register 160 value %u", value);
+              id(config_valid)[slot] = false;
+              id(ac_charge_start).publish_state(NAN);
+              return;
+            }
+            id(config_shadow)[slot] = value;
+            id(config_valid)[slot] = true;
+            id(ac_charge_start).update();
+            id(inverter_modbus_online).publish_state(true);
+            id(inverter_modbus_status).publish_state("Online");
+
+  - platform: modbus_controller
+    modbus_controller_id: inverter_1
+    id: ac_charge_stop_raw
+    name: "ac_charge_stop_raw"
+    internal: true
+    register_type: holding
+    address: 161
+    skip_updates: 2
+    value_type: U_WORD
+    on_value:
+      then:
+        - lambda: |-
+            if (isnan(x)) return;
+            const uint8_t slot = 3;
+            if (id(config_write_pending)[slot] &&
+                (id(config_pending_since)[slot] == 0 ||
+                 millis() - id(config_pending_since)[slot] < 30000)) return;
+            id(config_write_pending)[slot] = false;
+            const uint16_t value = uint16_t(x);
+            if (value < 20 || value > 100) {
+              ESP_LOGW("settings", "Rejected invalid register 161 value %u", value);
+              id(config_valid)[slot] = false;
+              id(ac_charge_stop).publish_state(NAN);
+              return;
+            }
+            id(config_shadow)[slot] = value;
+            id(config_valid)[slot] = true;
+            id(ac_charge_stop).update();
+            id(inverter_modbus_online).publish_state(true);
+            id(inverter_modbus_status).publish_state("Online");
+
+  - platform: modbus_controller
+    modbus_controller_id: inverter_1
+    id: ac_charge_cur_raw
+    name: "ac_charge_cur_raw"
+    internal: true
+    register_type: holding
+    address: 168
+    skip_updates: 2
+    value_type: U_WORD
+    on_value:
+      then:
+        - lambda: |-
+            if (isnan(x)) return;
+            const uint8_t slot = 4;
+            if (id(config_write_pending)[slot] &&
+                (id(config_pending_since)[slot] == 0 ||
+                 millis() - id(config_pending_since)[slot] < 30000)) return;
+            id(config_write_pending)[slot] = false;
+            const uint16_t value = uint16_t(x);
+            if (value > 125) {
+              ESP_LOGW("settings", "Rejected invalid register 168 value %u", value);
+              id(config_valid)[slot] = false;
+              id(ac_charge_cur).publish_state(NAN);
+              return;
+            }
+            id(config_shadow)[slot] = value;
+            id(config_valid)[slot] = true;
+            id(ac_charge_cur).update();
+            id(inverter_modbus_online).publish_state(true);
+            id(inverter_modbus_status).publish_state("Online");
+
+  - platform: modbus_controller
+    modbus_controller_id: inverter_1
+    id: ac_couple_start_soc_raw
+    name: "ac_couple_start_soc_raw"
+    internal: true
+    register_type: holding
+    address: 220
+    skip_updates: 2
+    value_type: U_WORD
+    on_value:
+      then:
+        - lambda: |-
+            if (isnan(x)) return;
+            const uint8_t slot = 5;
+            if (id(config_write_pending)[slot] &&
+                (id(config_pending_since)[slot] == 0 ||
+                 millis() - id(config_pending_since)[slot] < 30000)) return;
+            id(config_write_pending)[slot] = false;
+            const uint16_t value = uint16_t(x);
+            if (value > 101) {
+              ESP_LOGW("settings", "Rejected invalid register 220 value %u", value);
+              id(config_valid)[slot] = false;
+              id(ac_couple_start_soc).publish_state(NAN);
+              return;
+            }
+            id(config_shadow)[slot] = value;
+            id(config_valid)[slot] = true;
+            id(ac_couple_start_soc).update();
+            id(inverter_modbus_online).publish_state(true);
+            id(inverter_modbus_status).publish_state("Online");
+
+  - platform: modbus_controller
+    modbus_controller_id: inverter_1
+    id: ac_couple_end_soc_raw
+    name: "ac_couple_end_soc_raw"
+    internal: true
+    register_type: holding
+    address: 221
+    skip_updates: 2
+    value_type: U_WORD
+    on_value:
+      then:
+        - lambda: |-
+            if (isnan(x)) return;
+            const uint8_t slot = 6;
+            if (id(config_write_pending)[slot] &&
+                (id(config_pending_since)[slot] == 0 ||
+                 millis() - id(config_pending_since)[slot] < 30000)) return;
+            id(config_write_pending)[slot] = false;
+            const uint16_t value = uint16_t(x);
+            if (value > 101) {
+              ESP_LOGW("settings", "Rejected invalid register 221 value %u", value);
+              id(config_valid)[slot] = false;
+              id(ac_couple_end_soc).publish_state(NAN);
+              return;
+            }
+            id(config_shadow)[slot] = value;
+            id(config_valid)[slot] = true;
+            id(ac_couple_end_soc).update();
+            id(inverter_modbus_online).publish_state(true);
+            id(inverter_modbus_status).publish_state("Online");
+
+  # AC Charge schedule window 1. The 6000XP packs the hour in the low
+  # byte and minutes in the high byte: (minute << 8) | hour.
+  - platform: modbus_controller
+    modbus_controller_id: inverter_1
+    id: ac_charge_start_time_raw
+    name: "ac_charge_start_time_raw"
+    internal: true
+    register_type: holding
+    address: 68
+    skip_updates: 2
+    value_type: U_WORD
+    on_value:
+      then:
+        - lambda: |-
+            if (isnan(x)) return;
+            if (id(ac_charge_time_write_pending) &&
+                (id(ac_charge_time_pending_since) == 0 ||
+                 millis() - id(ac_charge_time_pending_since) < 30000)) return;
+            id(ac_charge_time_write_pending) = false;
+            const uint16_t raw = uint16_t(x);
+            if ((raw & 0xFF) > 23 || (raw >> 8) > 59) {
+              ESP_LOGW("charge_time", "Rejected invalid register 68 value 0x%04X", raw);
+              id(ac_charge_time_valid)[0] = false;
+              return;
+            }
+            id(ac_charge_time_shadow)[0] = raw;
+            id(ac_charge_time_valid)[0] = true;
+            id(ac_charge_start_time).update();
+            id(inverter_modbus_online).publish_state(true);
+            id(inverter_modbus_status).publish_state("Online");
+
+  - platform: modbus_controller
+    modbus_controller_id: inverter_1
+    id: ac_charge_end_time_raw
+    name: "ac_charge_end_time_raw"
+    internal: true
+    register_type: holding
+    address: 69
+    skip_updates: 2
+    value_type: U_WORD
+    on_value:
+      then:
+        - lambda: |-
+            if (isnan(x)) return;
+            if (id(ac_charge_time_write_pending) &&
+                (id(ac_charge_time_pending_since) == 0 ||
+                 millis() - id(ac_charge_time_pending_since) < 30000)) return;
+            id(ac_charge_time_write_pending) = false;
+            const uint16_t raw = uint16_t(x);
+            if ((raw & 0xFF) > 23 || (raw >> 8) > 59) {
+              ESP_LOGW("charge_time", "Rejected invalid register 69 value 0x%04X", raw);
+              id(ac_charge_time_valid)[1] = false;
+              return;
+            }
+            id(ac_charge_time_shadow)[1] = raw;
+            id(ac_charge_time_valid)[1] = true;
+            id(ac_charge_end_time).update();
+            id(inverter_modbus_online).publish_state(true);
+            id(inverter_modbus_status).publish_state("Online");
+
+  # AC First is a schedule, not a boolean. Read the first start/end window
+  # together (holding registers 152/153) and publish a confirmed switch state.
+  - platform: modbus_controller
+    modbus_controller_id: inverter_1
+    name: "ac_first_schedule_raw"
+    id: ac_first_schedule_raw
+    register_type: holding
+    address: 152
+    register_count: 2
+    value_type: U_WORD
+    internal: true
+    lambda: |-
+      const size_t offset = item->offset;
+      if (data.size() < offset + 4) return NAN;
+      const uint16_t start = (uint16_t(data[offset]) << 8) |
+                             uint16_t(data[offset + 1]);
+      const uint16_t end = (uint16_t(data[offset + 2]) << 8) |
+                           uint16_t(data[offset + 3]);
+      id(ac_first_current_start) = start;
+      id(ac_first_current_end) = end;
+      if (start == 0x0000 && end == 0x3B17) return 1.0f;  // all day
+      if (start == 0x0000 && end == 0x0000) return 0.0f;  // disabled
+      return 2.0f;  // custom or partially written window
+    on_value:
+      then:
+        - lambda: |-
+            if (isnan(x)) return;
+
+            const uint32_t pending_age = millis() - id(ac_first_pending_since);
+            if (id(ac_first_write_pending) &&
+                !id(ac_first_verification_dispatch) &&
+                (id(ac_first_pending_since) == 0 || pending_age < 30000)) return;
+
+            bool pair_failed = false;
+            if (id(ac_first_write_pending)) {
+              const bool matched =
+                id(ac_first_current_start) == id(ac_first_desired_start) &&
+                id(ac_first_current_end) == id(ac_first_desired_end);
+              if (!matched && id(ac_first_retry_count) < 2) {
+                ++id(ac_first_retry_count);
+                ESP_LOGW("ac_first", "AC First pair did not match; retry %u of 2",
+                         id(ac_first_retry_count));
+                id(ac_first_pending_since) = 0;
+                id(write_ac_first_schedule).execute(int(id(ac_first_write_generation)));
+                return;
+              }
+              if (!matched) {
+                if (id(ac_first_desired_on)) {
+                  ESP_LOGE("ac_first", "All-day write failed; rolling window 1 back to its prior state");
+                  const uint32_t rollback_generation = ++id(ac_first_write_generation);
+                  id(ac_first_desired_on) = false;
+                  id(ac_first_desired_start) = id(ac_first_restore_available)
+                    ? id(ac_first_saved_start) : 0x0000;
+                  id(ac_first_desired_end) = id(ac_first_restore_available)
+                    ? id(ac_first_saved_end) : 0x0000;
+                  id(ac_first_retry_count) = 0;
+                  id(ac_first_pending_since) = 0;
+                  id(ac_first).publish_state(false);
+                  id(write_ac_first_schedule).execute(int(rollback_generation));
+                  return;
+                }
+                ESP_LOGE("ac_first", "AC First rollback/clear failed; publishing actual state");
+                pair_failed = true;
+                id(ac_first_pair_fault) = true;
+                id(ac_first_custom_stable_samples) = 0;
+              } else {
+                id(ac_first_pair_fault) = false;
+                if (x == 2.0f) {
+                  // A generation-tagged readback of our complete desired pair
+                  // is already authoritative; no second periodic sample is
+                  // needed after a successful Restore/rollback.
+                  id(ac_first_custom_candidate_start) = id(ac_first_current_start);
+                  id(ac_first_custom_candidate_end) = id(ac_first_current_end);
+                  id(ac_first_custom_stable_samples) = 2;
+                } else {
+                  id(ac_first_custom_stable_samples) = 0;
+                }
+                if (!id(ac_first_desired_on)) {
+                  id(ac_first_restore_available) = false;
+                }
+              }
+            } else {
+              const bool fault_target_matched =
+                id(ac_first_current_start) == id(ac_first_desired_start) &&
+                id(ac_first_current_end) == id(ac_first_desired_end);
+              if (id(ac_first_pair_fault) && fault_target_matched) {
+                // Clear a latched fault only when the physical pair reaches
+                // the exact failed target, not merely another valid schedule.
+                id(ac_first_pair_fault) = false;
+                if (x == 2.0f) {
+                  id(ac_first_custom_candidate_start) = id(ac_first_current_start);
+                  id(ac_first_custom_candidate_end) = id(ac_first_current_end);
+                  id(ac_first_custom_stable_samples) = 2;
+                } else {
+                  id(ac_first_custom_stable_samples) = 0;
+                }
+                if (!id(ac_first_desired_on)) {
+                  id(ac_first_restore_available) = false;
+                }
+              }
+
+              if (!id(ac_first_pair_fault)) {
+                if (x == 2.0f) {
+                  // An external app may update the two words separately. Do
+                  // not persist a mixed in-between pair: require the same
+                  // custom pair in two consecutive complete FC03 samples.
+                  const bool matches_saved = id(ac_first_restore_available) &&
+                    id(ac_first_current_start) == id(ac_first_saved_start) &&
+                    id(ac_first_current_end) == id(ac_first_saved_end);
+                  if (matches_saved) {
+                    id(ac_first_custom_candidate_start) = id(ac_first_current_start);
+                    id(ac_first_custom_candidate_end) = id(ac_first_current_end);
+                    id(ac_first_custom_stable_samples) = 2;
+                  } else if (
+                      id(ac_first_current_start) == id(ac_first_custom_candidate_start) &&
+                      id(ac_first_current_end) == id(ac_first_custom_candidate_end)) {
+                    if (id(ac_first_custom_stable_samples) < 2) {
+                      ++id(ac_first_custom_stable_samples);
+                    }
+                  } else {
+                    id(ac_first_custom_candidate_start) = id(ac_first_current_start);
+                    id(ac_first_custom_candidate_end) = id(ac_first_current_end);
+                    id(ac_first_custom_stable_samples) = 1;
+                  }
+                  if (id(ac_first_custom_stable_samples) >= 2) {
+                    id(ac_first_saved_start) = id(ac_first_current_start);
+                    id(ac_first_saved_end) = id(ac_first_current_end);
+                    id(ac_first_restore_available) = true;
+                  }
+                } else if (x == 0.0f) {
+                  id(ac_first_restore_available) = false;
+                  id(ac_first_custom_stable_samples) = 0;
+                } else {
+                  id(ac_first_custom_stable_samples) = 0;
+                }
+              }
+            }
+
+            id(ac_first_write_pending) = false;
+            id(ac_first_schedule_valid) = true;
+            id(ac_first).publish_state(x == 1.0f);
+            if (id(ac_first_pair_fault)) {
+              if (x == 1.0f) {
+                id(ac_first_window1_status).publish_state(
+                  "FAULT - Write Mismatch (Actual: All Day)");
+              } else if (x == 0.0f) {
+                id(ac_first_window1_status).publish_state(
+                  "FAULT - Write Mismatch (Actual: Disabled)");
+              } else {
+                id(ac_first_window1_status).publish_state(
+                  "FAULT - Write Mismatch (Actual: Custom/Partial)");
+              }
+            } else if (x == 1.0f) {
+              id(ac_first_window1_status).publish_state("All Day");
+            } else if (x == 0.0f) {
+              id(ac_first_window1_status).publish_state("Disabled");
+            } else {
+              id(ac_first_window1_status).publish_state(
+                id(ac_first_custom_stable_samples) >= 2
+                  ? "Custom Schedule"
+                  : "Custom Schedule (Confirming)");
+            }
+            id(inverter_modbus_online).publish_state(true);
+            id(inverter_modbus_status).publish_state(
+              pair_failed ? "Online - AC First window mismatch" : "Online");
 
   - platform: modbus_controller
     modbus_controller_id: inverter_1
@@ -131,7 +831,6 @@ sensor:
     id: vbat
     register_type: read
     address: 4
-    skip_updates: 5
     unit_of_measurement: "V"
     accuracy_decimals: 2
     value_type: U_WORD
@@ -152,24 +851,19 @@ sensor:
     filters:
       - lambda: |-
           // reg 5 appears packed as 0xHHLL (HH=other, LL=SOC)
-          int soc = (int(x) & 0xFF);
-          if (soc > 100) soc = 100;
-          return soc;
-    on_value_range:
-      - above: 97
-        then:
-          - if:
-              condition:
-                and:
-                  - switch.is_on: auto_disable_charge_based_on
-                  - lambda: |-
-                      return !isnan(id(reg120).state) &&
-                             (((uint16_t) id(reg120).state & 0x0E) == 0x02);
-              then:
-                - logger.log: "Battery SOC reached 98 percent; disabling time-based AC charging"
-                - select.set:
-                    id: ac_charge_based_on
-                    option: "Disabled"
+          if (isnan(x)) return NAN;
+          const uint8_t soc = uint16_t(x) & 0xFF;
+          if (soc > 100) {
+            ESP_LOGW("battery", "Rejected invalid SOC value %u", soc);
+            return NAN;
+          }
+          return float(soc);
+    # This is deliberately level-triggered instead of edge-triggered. If the
+    # controller was still starting when SOC reached 100%, the policy retries
+    # on the next valid poll rather than waiting for SOC to fall and rise again.
+    on_value:
+      then:
+        - script.execute: enforce_high_soc_charge_policy
 
   - platform: modbus_controller
     modbus_controller_id: inverter_1
@@ -197,7 +891,7 @@ sensor:
     id: grid_volt
     register_type: read
     address: 12
-    register_count: 4   # spans 12-15 to batch with adjacent sensors in one FC04 request
+    register_count: 5   # spans 12-16; next sensor starts at 17
     unit_of_measurement: "V"
     accuracy_decimals: 2
     value_type: U_WORD
@@ -211,7 +905,7 @@ sensor:
     id: prec
     register_type: read
     address: 17
-    register_count: 6   # spans 17-22 to batch with adjacent sensors in one FC04 request
+    register_count: 7   # spans 17-23; next sensor starts at 24
     unit_of_measurement: "W"
     value_type: U_WORD
     state_class: measurement
@@ -222,18 +916,17 @@ sensor:
     id: eps_power
     register_type: read
     address: 24
-    register_count: 2   # spans 24-25 to batch with adjacent sensors in one FC04 request
+    register_count: 3   # spans 24-26; next sensor starts at 27
     unit_of_measurement: "W"
     value_type: U_WORD
     state_class: measurement
 
   - platform: modbus_controller
     modbus_controller_id: inverter_1
-    name: "Grid Power"
+    name: "Grid Import Power"
     id: pinv
     register_type: read
     address: 27
-    register_count: 49  # spans 27-75 to batch temp_battery (67) in one FC04 request
     unit_of_measurement: "W"
     value_type: U_WORD
     state_class: measurement
@@ -260,232 +953,845 @@ sensor:
     value_type: U_WORD
     state_class: measurement
 
+script:
+  # Snapshot and enqueue recovery in the same event-loop turn as on_online, so
+  # a new HA write cannot be accepted between generation capture and queueing.
+  # Duplicate allowance safely puts the reads behind the recovering front
+  # command. Single mode plus the final delay bounds batches on a flapping link.
+  - id: refresh_inverter_state
+    mode: single
+    then:
+      - lambda: |-
+          const bool allow_duplicates = inverter_1->get_allow_duplicate_commands();
+          inverter_1->set_allow_duplicate_commands(true);
+          const uint32_t reg120_generation = id(reg120_write_generation);
+          const uint32_t charge_time_generation = id(ac_charge_time_write_generation);
+          const uint32_t ac_first_generation = id(ac_first_write_generation);
+          const auto config_generations = id(config_write_generation);
+
+          auto reg120_cmd =
+            esphome::modbus_controller::ModbusCommandItem::create_read_command(
+              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING, 120, 1,
+              [reg120_generation](esphome::modbus::ModbusRegisterType register_type,
+                                  uint16_t start_address,
+                                  const std::vector<uint8_t> &data) {
+                if (data.size() < 2) return;
+                if (reg120_generation == id(reg120_write_generation)) {
+                  id(reg120_write_pending) = false;
+                }
+                inverter_1->on_register_data(register_type, start_address, data);
+              });
+          auto battery_cmd =
+            esphome::modbus_controller::ModbusCommandItem::create_read_command(
+              inverter_1, esphome::modbus::ModbusRegisterType::INPUT_REGISTER, 4, 2);
+
+          auto charge_time_cmd =
+            esphome::modbus_controller::ModbusCommandItem::create_read_command(
+              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING, 68, 2,
+              [charge_time_generation](esphome::modbus::ModbusRegisterType register_type,
+                                       uint16_t start_address,
+                                       const std::vector<uint8_t> &data) {
+                if (data.size() < 4) return;
+                if (charge_time_generation == id(ac_charge_time_write_generation)) {
+                  id(ac_charge_time_write_pending) = false;
+                }
+                inverter_1->on_register_data(register_type, start_address, data);
+              });
+          auto eod_cmd =
+            esphome::modbus_controller::ModbusCommandItem::create_read_command(
+              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING, 105, 1,
+              [config_generations](esphome::modbus::ModbusRegisterType register_type,
+                                   uint16_t start_address,
+                                   const std::vector<uint8_t> &data) {
+                if (data.size() < 2) return;
+                if (config_generations[0] == id(config_write_generation)[0]) {
+                  id(config_write_pending)[0] = false;
+                }
+                inverter_1->on_register_data(register_type, start_address, data);
+              });
+          auto cutoff_cmd =
+            esphome::modbus_controller::ModbusCommandItem::create_read_command(
+              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING, 125, 1,
+              [config_generations](esphome::modbus::ModbusRegisterType register_type,
+                                   uint16_t start_address,
+                                   const std::vector<uint8_t> &data) {
+                if (data.size() < 2) return;
+                if (config_generations[1] == id(config_write_generation)[1]) {
+                  id(config_write_pending)[1] = false;
+                }
+                inverter_1->on_register_data(register_type, start_address, data);
+              });
+          auto ac_first_cmd =
+            esphome::modbus_controller::ModbusCommandItem::create_read_command(
+              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING, 152, 2,
+              [ac_first_generation](esphome::modbus::ModbusRegisterType register_type,
+                                    uint16_t start_address,
+                                    const std::vector<uint8_t> &data) {
+                if (data.size() < 4) return;
+                if (ac_first_generation != id(ac_first_write_generation)) return;
+                id(ac_first_verification_dispatch) = true;
+                inverter_1->on_register_data(register_type, start_address, data);
+                id(ac_first_verification_dispatch) = false;
+              });
+          auto ac_charge_soc_cmd =
+            esphome::modbus_controller::ModbusCommandItem::create_read_command(
+              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING, 160, 2,
+              [config_generations](esphome::modbus::ModbusRegisterType register_type,
+                                   uint16_t start_address,
+                                   const std::vector<uint8_t> &data) {
+                if (data.size() < 4) return;
+                if (config_generations[2] == id(config_write_generation)[2]) {
+                  id(config_write_pending)[2] = false;
+                }
+                if (config_generations[3] == id(config_write_generation)[3]) {
+                  id(config_write_pending)[3] = false;
+                }
+                inverter_1->on_register_data(register_type, start_address, data);
+              });
+          auto ac_current_cmd =
+            esphome::modbus_controller::ModbusCommandItem::create_read_command(
+              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING, 168, 1,
+              [config_generations](esphome::modbus::ModbusRegisterType register_type,
+                                   uint16_t start_address,
+                                   const std::vector<uint8_t> &data) {
+                if (data.size() < 2) return;
+                if (config_generations[4] == id(config_write_generation)[4]) {
+                  id(config_write_pending)[4] = false;
+                }
+                inverter_1->on_register_data(register_type, start_address, data);
+              });
+          auto ac_couple_soc_cmd =
+            esphome::modbus_controller::ModbusCommandItem::create_read_command(
+              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING, 220, 2,
+              [config_generations](esphome::modbus::ModbusRegisterType register_type,
+                                   uint16_t start_address,
+                                   const std::vector<uint8_t> &data) {
+                if (data.size() < 4) return;
+                if (config_generations[5] == id(config_write_generation)[5]) {
+                  id(config_write_pending)[5] = false;
+                }
+                if (config_generations[6] == id(config_write_generation)[6]) {
+                  id(config_write_pending)[6] = false;
+                }
+                inverter_1->on_register_data(register_type, start_address, data);
+              });
+
+          inverter_1->queue_command(reg120_cmd);
+          inverter_1->queue_command(battery_cmd);
+          inverter_1->queue_command(charge_time_cmd);
+          inverter_1->queue_command(eod_cmd);
+          inverter_1->queue_command(cutoff_cmd);
+          inverter_1->queue_command(ac_first_cmd);
+          inverter_1->queue_command(ac_charge_soc_cmd);
+          inverter_1->queue_command(ac_current_cmd);
+          inverter_1->queue_command(ac_couple_soc_cmd);
+          inverter_1->set_allow_duplicate_commands(allow_duplicates);
+      - delay: 30s
+
+  # AC First window 1 uses two proven FC06 writes. If one word is rejected,
+  # the pair readback retries the complete desired schedule at most twice so
+  # a partial start/end update cannot silently remain active forever.
+  - id: write_ac_first_schedule
+    mode: restart
+    parameters:
+      generation: int
+    then:
+      - lambda: |-
+          if (uint32_t(generation) != id(ac_first_write_generation) ||
+              !id(ac_first_write_pending)) return;
+
+          const uint16_t start_time = id(ac_first_desired_start);
+          const uint16_t end_time = id(ac_first_desired_end);
+          const bool allow_duplicates = inverter_1->get_allow_duplicate_commands();
+          inverter_1->set_allow_duplicate_commands(true);
+
+          auto start_cmd =
+            esphome::modbus_controller::ModbusCommandItem::create_write_single_command(
+              inverter_1, 152, start_time);
+          auto end_cmd =
+            esphome::modbus_controller::ModbusCommandItem::create_write_single_command(
+              inverter_1, 153, end_time);
+          start_cmd.on_data_func = [generation](
+              esphome::modbus::ModbusRegisterType register_type,
+              uint16_t start_address, const std::vector<uint8_t> &data) {
+            inverter_1->on_write_register_response(register_type, start_address, data);
+            if (uint32_t(generation) == id(ac_first_write_generation) &&
+                id(ac_first_write_pending)) {
+              id(ac_first_pending_since) = std::max<uint32_t>(1, millis());
+            }
+          };
+          end_cmd.on_data_func = [generation](
+              esphome::modbus::ModbusRegisterType register_type,
+              uint16_t start_address, const std::vector<uint8_t> &data) {
+            inverter_1->on_write_register_response(register_type, start_address, data);
+            if (uint32_t(generation) == id(ac_first_write_generation) &&
+                id(ac_first_write_pending)) {
+              id(ac_first_pending_since) = std::max<uint32_t>(1, millis());
+            }
+          };
+          auto verify_cmd =
+            esphome::modbus_controller::ModbusCommandItem::create_read_command(
+              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING, 152, 2,
+              [generation](esphome::modbus::ModbusRegisterType register_type,
+                           uint16_t start_address,
+                           const std::vector<uint8_t> &data) {
+                if (uint32_t(generation) != id(ac_first_write_generation)) return;
+                if (data.size() < 4) {
+                  ESP_LOGW("ac_first", "Short AC First readback");
+                  return;
+                }
+                id(ac_first_verification_dispatch) = true;
+                inverter_1->on_register_data(register_type, start_address, data);
+                id(ac_first_verification_dispatch) = false;
+              });
+
+          inverter_1->queue_command(start_cmd);
+          inverter_1->queue_command(end_cmd);
+          inverter_1->queue_command(verify_cmd);
+          inverter_1->set_allow_duplicate_commands(allow_duplicates);
+
+  # Enforce the optional high-SOC policy every time either input changes. The
+  # 6000XP has three modes that include a time condition: Time, Voltage+Time,
+  # and SOC+Time (register-120 values 0x02, 0x08 and 0x0A).
+  - id: enforce_high_soc_charge_policy
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: |-
+              if (!id(auto_disable_charge_based_on).state ||
+                  !id(reg120_shadow_valid) || isnan(id(bat_soc).state) ||
+                  id(bat_soc).state < 100.0f) {
+                return false;
+              }
+              const uint16_t mode = id(reg120_shadow) & 0x0E;
+              return mode == 0x02 || mode == 0x08 || mode == 0x0A;
+          then:
+            - logger.log: "Battery SOC is 100 percent; disabling time-based AC charging"
+            - select.set:
+                id: ac_charge_based_on
+                option: "Disabled"
+
+  # Shared dispatcher for the seven scalar configuration registers. Each
+  # caller reserves its own generation before invoking this queued script;
+  # stale queued work and stale verification replies are ignored safely.
+  - id: write_verified_config_word
+    mode: parallel
+    max_runs: 64
+    parameters:
+      slot: int
+      address: int
+      value: int
+      verify_address: int
+      verify_count: int
+      generation: int
+    then:
+      # Coalesce slider chatter for the same register before it reaches the
+      # Modbus queue; different settings can still proceed independently.
+      - delay: 50ms
+      - lambda: |-
+          if (slot < 0 || slot >= 7 ||
+              uint32_t(generation) != id(config_write_generation)[slot]) {
+            return;
+          }
+
+          const bool allow_duplicates = inverter_1->get_allow_duplicate_commands();
+          inverter_1->set_allow_duplicate_commands(true);
+
+          auto write_cmd =
+            esphome::modbus_controller::ModbusCommandItem::create_write_single_command(
+              inverter_1, uint16_t(address), uint16_t(value));
+          write_cmd.on_data_func = [slot, generation](
+              esphome::modbus::ModbusRegisterType register_type,
+              uint16_t start_address, const std::vector<uint8_t> &data) {
+            inverter_1->on_write_register_response(register_type, start_address, data);
+            if (slot >= 0 && slot < 7 &&
+                uint32_t(generation) == id(config_write_generation)[slot] &&
+                id(config_write_pending)[slot]) {
+              id(config_pending_since)[slot] = std::max<uint32_t>(1, millis());
+            }
+          };
+          auto verify_cmd =
+            esphome::modbus_controller::ModbusCommandItem::create_read_command(
+              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING,
+              uint16_t(verify_address), uint16_t(verify_count),
+              [slot, generation, verify_count](
+                esphome::modbus::ModbusRegisterType register_type,
+                uint16_t start_address,
+                const std::vector<uint8_t> &data) {
+                  if (slot < 0 || slot >= 7 ||
+                      uint32_t(generation) != id(config_write_generation)[slot]) return;
+                  if (data.size() < size_t(verify_count) * 2U) {
+                    ESP_LOGW("settings", "Short readback for register slot %d", slot);
+                    return;
+                  }
+                  id(config_write_pending)[slot] = false;
+                  inverter_1->on_register_data(register_type, start_address, data);
+                });
+
+          inverter_1->queue_command(write_cmd);
+          inverter_1->queue_command(verify_cmd);
+          inverter_1->set_allow_duplicate_commands(allow_duplicates);
+
+  - id: write_reg120
+    mode: restart
+    then:
+      # Coalesce near-simultaneous changes to the two register-120 controls.
+      - delay: 50ms
+      - lambda: |-
+          // Entry points reserve pending only after a valid read. Do not
+          // cancel that already-accepted intent if an offline callback lands
+          // during this short debounce; queued intent is reconciled later.
+          if (!id(reg120_write_pending)) {
+            return;
+          }
+
+          const uint16_t desired = id(reg120_shadow);
+          const uint32_t generation = id(reg120_write_generation);
+
+          const bool allow_duplicates = inverter_1->get_allow_duplicate_commands();
+          inverter_1->set_allow_duplicate_commands(true);
+
+          auto write_cmd =
+            esphome::modbus_controller::ModbusCommandItem::create_write_single_command(
+              inverter_1, 120, desired);
+          write_cmd.on_data_func = [generation](
+              esphome::modbus::ModbusRegisterType register_type,
+              uint16_t start_address, const std::vector<uint8_t> &data) {
+            inverter_1->on_write_register_response(register_type, start_address, data);
+            if (generation == id(reg120_write_generation) &&
+                id(reg120_write_pending)) {
+              id(reg120_pending_since) = std::max<uint32_t>(1, millis());
+            }
+          };
+          auto verify_cmd =
+            esphome::modbus_controller::ModbusCommandItem::create_read_command(
+              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING, 120, 1,
+              [generation](esphome::modbus::ModbusRegisterType register_type,
+                           uint16_t start_address,
+                           const std::vector<uint8_t> &data) {
+                // A later desired value supersedes this readback.
+                if (generation != id(reg120_write_generation)) return;
+                id(reg120_write_pending) = false;
+                id(reg120_verification_dispatch) = true;
+                inverter_1->on_register_data(register_type, start_address, data);
+                id(reg120_verification_dispatch) = false;
+              });
+
+          inverter_1->queue_command(write_cmd);
+          inverter_1->queue_command(verify_cmd);
+          inverter_1->set_allow_duplicate_commands(allow_duplicates);
+
+          ESP_LOGD("reg120", "Queued generation=%u value=%u",
+                   (unsigned) generation, (unsigned) desired);
+
+# A same-generation FC06 acknowledgement normally starts the timeout clock.
+# If both that acknowledgement and its tagged readback are lost/exceptioned,
+# pending_since remains zero. This watchdog invokes the duplicate-safe recovery
+# batch; its reads are appended behind every already-queued write, so they can
+# authoritatively reconcile without accepting a stale pre-write poll. The
+# recovery script's 30-second single-mode latch rate-limits repeated failures.
+interval:
+  - interval: 10s
+    then:
+      - lambda: |-
+          static uint32_t reg120_seen_at = 0;
+          static uint32_t reg120_seen_generation = 0;
+          static uint32_t ac_first_seen_at = 0;
+          static uint32_t ac_first_seen_generation = 0;
+          static uint32_t charge_time_seen_at = 0;
+          static uint32_t charge_time_seen_generation = 0;
+          static std::array<uint32_t, 7> config_seen_at{};
+          static std::array<uint32_t, 7> config_seen_generation{};
+
+          const uint32_t now_raw = millis();
+          const uint32_t now = now_raw == 0 ? 1 : now_raw;
+          auto is_stuck = [now](bool pending, uint32_t acknowledged_at,
+                                uint32_t generation, uint32_t &seen_at,
+                                uint32_t &seen_generation) -> bool {
+            if (!pending || acknowledged_at != 0) {
+              seen_at = 0;
+              seen_generation = generation;
+              return false;
+            }
+            if (seen_at == 0 || seen_generation != generation) {
+              seen_at = now;
+              seen_generation = generation;
+              return false;
+            }
+            if (now - seen_at < 30000) return false;
+            seen_at = now;  // rate-limit another tail recovery attempt
+            return true;
+          };
+
+          bool stuck = is_stuck(
+            id(reg120_write_pending), id(reg120_pending_since),
+            id(reg120_write_generation), reg120_seen_at,
+            reg120_seen_generation);
+          stuck = is_stuck(
+            id(ac_first_write_pending), id(ac_first_pending_since),
+            id(ac_first_write_generation), ac_first_seen_at,
+            ac_first_seen_generation) || stuck;
+          stuck = is_stuck(
+            id(ac_charge_time_write_pending), id(ac_charge_time_pending_since),
+            id(ac_charge_time_write_generation), charge_time_seen_at,
+            charge_time_seen_generation) || stuck;
+          for (uint8_t slot = 0; slot < 7; slot++) {
+            stuck = is_stuck(
+              id(config_write_pending)[slot], id(config_pending_since)[slot],
+              id(config_write_generation)[slot], config_seen_at[slot],
+              config_seen_generation[slot]) || stuck;
+          }
+          if (stuck) {
+            id(refresh_inverter_state).execute();
+          }
+
 select:
 
-  - platform: modbus_controller
-    use_write_multiple: false
-    modbus_controller_id: inverter_1
+  - platform: template
     name: "AC Charge Based On"
     id: ac_charge_based_on
-    address: 120
     entity_category: config
-    value_type: U_WORD
-    optionsmap:
-      "Disabled": 0
-      "According To Time": 2
-      "According To Voltage": 4
-      "According To SOC": 6
-      "According To Voltage/Time": 8
-      "According To SOC/Time": 10
-    lambda: |-
-      uint16_t bits = (int(x) & 0x0E);
-      if (bits == 0)  return std::string("Disabled");
-      if (bits == 2)  return std::string("According To Time");
-      if (bits == 4)  return std::string("According To Voltage");
-      if (bits == 6)  return std::string("According To SOC");
-      if (bits == 8)  return std::string("According To Voltage/Time");
-      if (bits == 10) return std::string("According To SOC/Time");
-      return {};
-    write_lambda: |-
-      if (isnan(id(reg120).state)) return {};
-      uint16_t current = (uint16_t) id(reg120).state;
-      uint16_t updated = (current & ~0x0E) | (value & 0x0E);
-      ESP_LOGD("ac_charge_based_on", "reg120 current=%u, option_value=%lld, writing=%u",
-               (unsigned) current, (long long) value, (unsigned) updated);
-      return updated;
-    on_value:
-      then:
-        - lambda: |-
-            if (x != "Disabled") {
-              // AC Charge Based On set to something active - optimistically turn on AC First
-              // Use publish_state (not turn_on) because the modbus write already happened via write_lambda
-              // We just need the switch UI to reflect on without triggering another reg153 write
-              ESP_LOGD("ac_charge_based_on", "AC Charge Based On set to '%s' - enabling AC First", x.c_str());
-              id(ac_first).publish_state(true);
-            }
+    options:
+      - "Disabled"
+      - "According To Time"
+      - "According To Voltage"
+      - "According To SOC"
+      - "According To Voltage/Time"
+      - "According To SOC/Time"
+    set_action:
+      - lambda: |-
+          if (!id(reg120_shadow_valid)) {
+            ESP_LOGW("ac_charge_based_on", "Ignored change before register 120 was read");
+            return;
+          }
 
-  - platform: modbus_controller
-    use_write_multiple: false
-    modbus_controller_id: inverter_1
+          uint16_t option_bits = 0;
+          if (x == "According To Time") option_bits = 0x02;
+          else if (x == "According To Voltage") option_bits = 0x04;
+          else if (x == "According To SOC") option_bits = 0x06;
+          else if (x == "According To Voltage/Time") option_bits = 0x08;
+          else if (x == "According To SOC/Time") option_bits = 0x0A;
+          else if (x != "Disabled") return;
+
+          // Any enabled AC Charge method also requires AC First. Invoke the
+          // real switch action so registers 152/153 are written and verified;
+          // publish_state() alone would only change Home Assistant's display.
+          if (option_bits != 0 && !id(ac_first).state) {
+            id(ac_first).turn_on();
+            // The AC First action publishes synchronously only after its
+            // schedule is valid/confirmed. If it rejected the request, leave
+            // register 120 unchanged so the two controls cannot disagree.
+            if (!id(ac_first).state) {
+              ESP_LOGW("ac_charge_based_on",
+                       "Ignored enabled mode because AC First could not be turned on");
+              return;
+            }
+          }
+
+          const uint16_t current = id(reg120_shadow);
+          const uint16_t updated = (current & ~0x0E) | option_bits;
+          id(reg120_shadow) = updated;
+          ++id(reg120_write_generation);
+          id(reg120_write_pending) = true;
+          // Zero means accepted locally but not acknowledged yet. Ordinary
+          // polling must not reconcile it until the generation-specific FC06
+          // acknowledgement starts the confirmation timeout.
+          id(reg120_pending_since) = 0;
+          id(ac_charge_based_on).publish_state(x);
+          id(write_reg120).execute();
+          // A newly requested time-bearing mode must be checked immediately
+          // at high SOC. Disabled/non-time modes must not recursively restart
+          // the policy that selected them.
+          if (option_bits == 0x02 || option_bits == 0x08 || option_bits == 0x0A) {
+            id(enforce_high_soc_charge_policy).execute();
+          }
+          ESP_LOGD("ac_charge_based_on", "reg120 shadow=%u, writing=%u",
+                   (unsigned) current, (unsigned) updated);
+
+  - platform: template
     name: "Discharge Control"
     id: discharge_control
-    address: 120
     entity_category: config
-    value_type: U_WORD
-    optionsmap:
-      "According To Voltage": 0
-      "According To SOC": 16
-      "According To Both": 32
-    lambda: |-
-      uint16_t bits = (int(x) & 0x30);
-      if (bits == 0)  return std::string("According To Voltage");
-      if (bits == 16) return std::string("According To SOC");
-      if (bits == 32) return std::string("According To Both");
-      // bits == 48 (0x30): both bits set — invalid inverter state, treat as voltage
-      return std::string("According To Voltage");
-    write_lambda: |-
-      if (isnan(id(reg120).state)) return {};
-      uint16_t current = (uint16_t) id(reg120).state;
-      uint16_t updated = (current & ~0x30) | (value & 0x30);
-      ESP_LOGD("discharge_control", "reg120 current=%u, option_value=%lld, writing=%u",
-               (unsigned) current, (long long) value, (unsigned) updated);
-      return updated;
+    options:
+      - "According To Voltage"
+      - "According To SOC"
+      - "According To Both"
+    set_action:
+      - lambda: |-
+          if (!id(reg120_shadow_valid)) {
+            ESP_LOGW("discharge_control", "Ignored change before register 120 was read");
+            return;
+          }
+
+          uint16_t option_bits = 0;
+          if (x == "According To SOC") option_bits = 0x10;
+          else if (x == "According To Both") option_bits = 0x20;
+          else if (x != "According To Voltage") return;
+
+          const uint16_t current = id(reg120_shadow);
+          const uint16_t updated = (current & ~0x30) | option_bits;
+          id(reg120_shadow) = updated;
+          ++id(reg120_write_generation);
+          id(reg120_write_pending) = true;
+          id(reg120_pending_since) = 0;
+          id(discharge_control).publish_state(x);
+          id(write_reg120).execute();
+          ESP_LOGD("discharge_control", "reg120 shadow=%u, writing=%u",
+                   (unsigned) current, (unsigned) updated);
 
 switch:
 
   - platform: template
-    name: "Auto Disable Charge Based On"
+    name: "Auto Disable Time-Based AC Charge at 100%"
     id: auto_disable_charge_based_on
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      # Template-switch optimism publishes after this action. Publish first so
+      # the policy can see the new state immediately, then re-check SOC.
+      - lambda: id(auto_disable_charge_based_on).publish_state(true);
+      - script.execute: enforce_high_soc_charge_policy
 
   - platform: template
-    name: "AC First"
+    name: "AC First All Day (Window 1)"
     id: ac_first
     icon: "mdi:refresh"
-    restore_mode: RESTORE_DEFAULT_ON
-    lambda: |-
-      return id(reg153).state == 15127;
+    restore_mode: DISABLED
     turn_on_action:
       - lambda: |-
-          uint8_t hours = 23;
-          uint8_t minutes = 59;
-          uint16_t minuteshours = (minutes << 8) | hours;
-          esphome::modbus_controller::ModbusCommandItem cmd =
-            esphome::modbus_controller::ModbusCommandItem::create_write_single_command(inverter_1, 153, minuteshours);
-          inverter_1->queue_command(cmd);
-          id(ac_first).publish_state(true);   // optimistic update
-      - delay: 1s
-      - lambda: |-
-          id(inverter_1).update();
+          if (!id(ac_first_schedule_valid)) {
+            ESP_LOGW("ac_first", "Ignored change before AC First window 1 was read");
+            return;
+          }
+          // Window 1: start 00:00 (reg 152), end 23:59 (reg 153).
+          const bool custom_window =
+            !(id(ac_first_current_start) == 0x0000 &&
+              (id(ac_first_current_end) == 0x0000 ||
+               id(ac_first_current_end) == 0x3B17));
+          if (custom_window && !id(ac_first_pair_fault)) {
+            if (id(ac_first_custom_stable_samples) < 2 ||
+                id(ac_first_current_start) != id(ac_first_custom_candidate_start) ||
+                id(ac_first_current_end) != id(ac_first_custom_candidate_end)) {
+              ESP_LOGW("ac_first", "Custom window is still being confirmed; try All Day again after the next poll");
+              return;
+            }
+            id(ac_first_saved_start) = id(ac_first_current_start);
+            id(ac_first_saved_end) = id(ac_first_current_end);
+            id(ac_first_restore_available) = true;
+          } else if (id(ac_first_current_start) == 0x0000 &&
+                     id(ac_first_current_end) == 0x0000) {
+            id(ac_first_restore_available) = false;
+          }
+          const uint32_t generation = ++id(ac_first_write_generation);
+          id(ac_first_desired_on) = true;
+          id(ac_first_desired_start) = 0x0000;
+          id(ac_first_desired_end) = 0x3B17;
+          id(ac_first_retry_count) = 0;
+          id(ac_first_write_pending) = true;
+          id(ac_first_pending_since) = 0;
+          id(ac_first).publish_state(true);
+          id(write_ac_first_schedule).execute(int(generation));
     turn_off_action:
       - lambda: |-
-          // Write 00:00 to reg 153 to disable AC First
-          uint16_t minuteshours = 0x0000;
-          esphome::modbus_controller::ModbusCommandItem cmd =
-            esphome::modbus_controller::ModbusCommandItem::create_write_single_command(inverter_1, 153, minuteshours);
-          inverter_1->queue_command(cmd);
-          id(ac_first).publish_state(false);  // optimistic update
-
-          // If AC Charge Based On is anything other than Disabled, set it to Disabled
-          uint16_t current = (uint16_t) id(reg120).state;
-          if ((current & 0x0E) != 0) {
-            uint16_t updated = current & ~0x0E;
-            ESP_LOGD("ac_first", "AC First off - clearing AC Charge Based On. reg120 was=%d, writing=%d", current, updated);
-            esphome::modbus_controller::ModbusCommandItem cmd2 =
-              esphome::modbus_controller::ModbusCommandItem::create_write_single_command(inverter_1, 120, updated);
-            inverter_1->queue_command(cmd2);
-            id(ac_charge_based_on).publish_state("Disabled");  // optimistic update
+          if (!id(ac_first_schedule_valid)) {
+            ESP_LOGW("ac_first", "Ignored change before AC First window 1 was read");
+            return;
           }
-      - delay: 1s
-      - lambda: |-
-          id(inverter_1).update();
+          if (!id(ac_first).state) {
+            ESP_LOGW("ac_first", "Window 1 is not the all-day schedule; leaving it unchanged");
+            return;
+          }
+          // Restore a custom schedule that this control temporarily replaced;
+          // otherwise disable window 1. Windows 2/3 and AC Charge are separate
+          // inverter features and are intentionally left unchanged.
+          const uint32_t generation = ++id(ac_first_write_generation);
+          id(ac_first_desired_on) = false;
+          id(ac_first_desired_start) = id(ac_first_restore_available)
+            ? id(ac_first_saved_start) : 0x0000;
+          id(ac_first_desired_end) = id(ac_first_restore_available)
+            ? id(ac_first_saved_end) : 0x0000;
+          id(ac_first_retry_count) = 0;
+          id(ac_first_write_pending) = true;
+          id(ac_first_pending_since) = 0;
+          id(ac_first).publish_state(false);
+          id(write_ac_first_schedule).execute(int(generation));
 
   - platform: restart
     name: "Restart"
 
 number:
 
-  - platform: modbus_controller
-    modbus_controller_id: inverter_1
+  - platform: template
     name: "On Grid EOD SOC"
     id: on_grid_eod_soc
-    register_type: holding
-    address: 105
-    skip_updates: 6
-    value_type: U_WORD
     entity_category: config
     unit_of_measurement: "%"
-    min_value: 1
+    min_value: 0
     max_value: 90
     step: 1
+    update_interval: never
+    lambda: |-
+      if (!id(config_valid)[0]) return {};
+      return float(id(config_shadow)[0]);
+    set_action:
+      - lambda: |-
+          if (!id(config_valid)[0] || !id(config_valid)[1]) {
+            ESP_LOGW("settings", "Ignored EOD change before both EOD/Cut-off values were read");
+            return;
+          }
+          if (id(config_write_pending)[1]) {
+            ESP_LOGW("settings", "Wait for the EOD/Cut-off SOC write to be confirmed");
+            id(on_grid_eod_soc).update();
+            return;
+          }
+          const uint16_t desired = uint16_t(lroundf(x));
+          if (id(config_valid)[1] && desired < id(config_shadow)[1]) {
+            ESP_LOGW("settings", "Rejected On Grid EOD SOC %u: it must be at least Cut-off %u",
+                     desired, id(config_shadow)[1]);
+            id(on_grid_eod_soc).update();
+            return;
+          }
+          id(config_shadow)[0] = desired;
+          const uint32_t generation = ++id(config_write_generation)[0];
+          id(config_write_pending)[0] = true;
+          id(config_pending_since)[0] = 0;
+          id(on_grid_eod_soc).update();
+          id(write_verified_config_word).execute(0, 105, desired, 105, 1,
+                                                  int(generation));
 
-  - platform: modbus_controller
-    modbus_controller_id: inverter_1
+  - platform: template
     name: "Discharge Cut-off SOC"
     id: discharge_cutoff_soc
-    register_type: holding
-    address: 125
-    skip_updates: 6
-    value_type: U_WORD
     entity_category: config
     unit_of_measurement: "%"
-    min_value: 1
+    min_value: 0
     max_value: 90
     step: 1
+    update_interval: never
+    lambda: |-
+      if (!id(config_valid)[1]) return {};
+      return float(id(config_shadow)[1]);
+    set_action:
+      - lambda: |-
+          if (!id(config_valid)[0] || !id(config_valid)[1]) {
+            ESP_LOGW("settings", "Ignored Cut-off change before both EOD/Cut-off values were read");
+            return;
+          }
+          if (id(config_write_pending)[0]) {
+            ESP_LOGW("settings", "Wait for the EOD/Cut-off SOC write to be confirmed");
+            id(discharge_cutoff_soc).update();
+            return;
+          }
+          const uint16_t desired = uint16_t(lroundf(x));
+          if (id(config_valid)[0] && desired > id(config_shadow)[0]) {
+            ESP_LOGW("settings", "Rejected Discharge Cut-off SOC %u: it must not exceed EOD %u",
+                     desired, id(config_shadow)[0]);
+            id(discharge_cutoff_soc).update();
+            return;
+          }
+          id(config_shadow)[1] = desired;
+          const uint32_t generation = ++id(config_write_generation)[1];
+          id(config_write_pending)[1] = true;
+          id(config_pending_since)[1] = 0;
+          id(discharge_cutoff_soc).update();
+          id(write_verified_config_word).execute(1, 125, desired, 125, 1,
+                                                  int(generation));
 
-  - platform: modbus_controller
-    modbus_controller_id: inverter_1
+  - platform: template
     name: "AC Charge Start"
     id: ac_charge_start
-    register_type: holding
-    address: 160
-    skip_updates: 6
-    value_type: U_WORD
     entity_category: config
     unit_of_measurement: "%"
     min_value: 1
     max_value: 90
     step: 1
+    update_interval: never
+    lambda: |-
+      if (!id(config_valid)[2]) return {};
+      return float(id(config_shadow)[2]);
+    set_action:
+      - lambda: |-
+          if (!id(config_valid)[2] || !id(config_valid)[3]) {
+            ESP_LOGW("settings", "Ignored AC Charge Start before both Start/Stop values were read");
+            return;
+          }
+          if (id(config_write_pending)[3]) {
+            ESP_LOGW("settings", "Wait for the AC Charge Start/Stop write to be confirmed");
+            id(ac_charge_start).update();
+            return;
+          }
+          const uint16_t desired = uint16_t(lroundf(x));
+          if (id(config_valid)[3] && desired >= id(config_shadow)[3]) {
+            ESP_LOGW("settings", "Rejected AC Charge Start %u: it must be below Stop %u",
+                     desired, id(config_shadow)[3]);
+            id(ac_charge_start).update();
+            return;
+          }
+          id(config_shadow)[2] = desired;
+          const uint32_t generation = ++id(config_write_generation)[2];
+          id(config_write_pending)[2] = true;
+          id(config_pending_since)[2] = 0;
+          id(ac_charge_start).update();
+          id(write_verified_config_word).execute(2, 160, desired, 160, 2,
+                                                  int(generation));
 
-  - platform: modbus_controller
-    modbus_controller_id: inverter_1
+  - platform: template
     name: "AC Charge Stop"
     id: ac_charge_stop
-    register_type: holding
-    address: 161
-    skip_updates: 6
-    value_type: U_WORD
     entity_category: config
     unit_of_measurement: "%"
     min_value: 20
     max_value: 100
     step: 1
+    update_interval: never
+    lambda: |-
+      if (!id(config_valid)[3]) return {};
+      return float(id(config_shadow)[3]);
+    set_action:
+      - lambda: |-
+          if (!id(config_valid)[2] || !id(config_valid)[3]) {
+            ESP_LOGW("settings", "Ignored AC Charge Stop before both Start/Stop values were read");
+            return;
+          }
+          if (id(config_write_pending)[2]) {
+            ESP_LOGW("settings", "Wait for the AC Charge Start/Stop write to be confirmed");
+            id(ac_charge_stop).update();
+            return;
+          }
+          const uint16_t desired = uint16_t(lroundf(x));
+          if (id(config_valid)[2] && desired <= id(config_shadow)[2]) {
+            ESP_LOGW("settings", "Rejected AC Charge Stop %u: it must be above Start %u",
+                     desired, id(config_shadow)[2]);
+            id(ac_charge_stop).update();
+            return;
+          }
+          id(config_shadow)[3] = desired;
+          const uint32_t generation = ++id(config_write_generation)[3];
+          id(config_write_pending)[3] = true;
+          id(config_pending_since)[3] = 0;
+          id(ac_charge_stop).update();
+          id(write_verified_config_word).execute(3, 161, desired, 160, 2,
+                                                  int(generation));
 
-  - platform: modbus_controller
-    modbus_controller_id: inverter_1
+  - platform: template
     name: "AC Charge Current"
     id: ac_charge_cur
-    register_type: holding
-    address: 168
-    skip_updates: 6
-    value_type: U_WORD
     entity_category: config
     unit_of_measurement: "A"
     min_value: 0
-    max_value: 105
+    max_value: 125
     step: 1
+    update_interval: never
+    lambda: |-
+      if (!id(config_valid)[4]) return {};
+      return float(id(config_shadow)[4]);
+    set_action:
+      - lambda: |-
+          if (!id(config_valid)[4]) {
+            ESP_LOGW("settings", "Ignored AC Charge Current before register 168 was read");
+            return;
+          }
+          const uint16_t desired = uint16_t(lroundf(x));
+          id(config_shadow)[4] = desired;
+          const uint32_t generation = ++id(config_write_generation)[4];
+          id(config_write_pending)[4] = true;
+          id(config_pending_since)[4] = 0;
+          id(ac_charge_cur).update();
+          id(write_verified_config_word).execute(4, 168, desired, 168, 1,
+                                                  int(generation));
 
-  - platform: modbus_controller
-    modbus_controller_id: inverter_1
+  - platform: template
     name: "AC Couple Start SOC"
     id: ac_couple_start_soc
-    register_type: holding
-    address: 220
-    skip_updates: 6
-    value_type: U_WORD
     entity_category: config
     unit_of_measurement: "%"
     min_value: 0
-    max_value: 95
+    # The 6000XP manual allows 0-101 and recommends 99/100 for frequency shift.
+    max_value: 101
     step: 1
+    update_interval: never
+    lambda: |-
+      if (!id(config_valid)[5]) return {};
+      return float(id(config_shadow)[5]);
+    set_action:
+      - lambda: |-
+          if (!id(config_valid)[5] || !id(config_valid)[6]) {
+            ESP_LOGW("settings", "Ignored AC Couple Start before both Start/End values were read");
+            return;
+          }
+          if (id(config_write_pending)[6]) {
+            ESP_LOGW("settings", "Wait for the AC Couple Start/End write to be confirmed");
+            id(ac_couple_start_soc).update();
+            return;
+          }
+          const uint16_t desired = uint16_t(lroundf(x));
+          if (id(config_valid)[6] && desired >= id(config_shadow)[6]) {
+            ESP_LOGW("settings", "Rejected AC Couple Start SOC %u: it must be below End %u",
+                     desired, id(config_shadow)[6]);
+            id(ac_couple_start_soc).update();
+            return;
+          }
+          id(config_shadow)[5] = desired;
+          const uint32_t generation = ++id(config_write_generation)[5];
+          id(config_write_pending)[5] = true;
+          id(config_pending_since)[5] = 0;
+          id(ac_couple_start_soc).update();
+          id(write_verified_config_word).execute(5, 220, desired, 220, 2,
+                                                  int(generation));
 
-  - platform: modbus_controller
-    modbus_controller_id: inverter_1
+  - platform: template
     name: "AC Couple End SOC"
     id: ac_couple_end_soc
-    register_type: holding
-    address: 221
-    skip_updates: 6
-    value_type: U_WORD
     entity_category: config
     unit_of_measurement: "%"
     min_value: 0
-    max_value: 100
+    max_value: 101
     step: 1
+    update_interval: never
+    lambda: |-
+      if (!id(config_valid)[6]) return {};
+      return float(id(config_shadow)[6]);
+    set_action:
+      - lambda: |-
+          if (!id(config_valid)[5] || !id(config_valid)[6]) {
+            ESP_LOGW("settings", "Ignored AC Couple End before both Start/End values were read");
+            return;
+          }
+          if (id(config_write_pending)[5]) {
+            ESP_LOGW("settings", "Wait for the AC Couple Start/End write to be confirmed");
+            id(ac_couple_end_soc).update();
+            return;
+          }
+          const uint16_t desired = uint16_t(lroundf(x));
+          if (id(config_valid)[5] && desired <= id(config_shadow)[5]) {
+            ESP_LOGW("settings", "Rejected AC Couple End SOC %u: it must be above Start %u",
+                     desired, id(config_shadow)[5]);
+            id(ac_couple_end_soc).update();
+            return;
+          }
+          id(config_shadow)[6] = desired;
+          const uint32_t generation = ++id(config_write_generation)[6];
+          id(config_write_pending)[6] = true;
+          id(config_pending_since)[6] = 0;
+          id(ac_couple_end_soc).update();
+          id(write_verified_config_word).execute(6, 221, desired, 220, 2,
+                                                  int(generation));
 
 text_sensor:
+
+  - platform: template
+    name: "Inverter Modbus Status"
+    id: inverter_modbus_status
+    entity_category: diagnostic
+    icon: "mdi:transit-connection-variant"
+
+  - platform: template
+    name: "AC First Window 1 Status"
+    id: ac_first_window1_status
+    entity_category: diagnostic
+    icon: "mdi:calendar-clock"
 
   - platform: modbus_controller
     modbus_controller_id: inverter_1
@@ -493,7 +1799,6 @@ text_sensor:
     id: state
     register_type: read
     address: 0
-    register_count: 3   # spans 0-2 to batch adjacent sensors in one FC04 request
     raw_encode: HEXBYTES
     lambda: |-
       auto call = id(led).turn_on();
@@ -507,36 +1812,198 @@ text_sensor:
         call.perform();
         return std::string("Fault");
       }
+      if (x == "0002") {
+        call.set_rgb(1, 1, 0);
+        call.perform();
+        return std::string("Firmware Updating");
+      }
+      if (x == "0008") {
+        call.set_rgb(0, 0, 1);
+        call.perform();
+        return std::string("PV Charge");
+      }
       if (x == "0010") {
         call.set_rgb(0, 1, 0);
         call.perform();
-        return std::string("Grid Mode");
+        return std::string("Battery On-Grid");
       }
       if (x == "0011") {
-        call.set_rgb(1, 0, 0);
+        call.set_rgb(1, 1, 0);
         call.perform();
-        // Only trigger ac_first on transition into SOC Cut Off, not every poll
-        if (!id(ac_first).state) {
-         // id(ac_first).turn_on();
-        }
-        return std::string("SOC Cut Off");
+        return std::string("Bypass");
       }
       if (x == "00c0") {
         call.set_rgb(0, 0, 1);
         call.perform();
-        return std::string("Solar/Battery Mode");
+        return std::string("PV & Battery Off-Grid");
       }
       if (x == "0014") {
-        call.set_rgb(0, 0, 1);
+        call.set_rgb(0, 1, 0);
         call.perform();
-        return std::string("Battery/Grid Mode");
+        return std::string("PV & Battery On-Grid");
+      }
+      if (x == "0019") {
+        call.set_rgb(0, 1, 0);
+        call.perform();
+        return std::string("PV Charge + Bypass");
+      }
+      if (x == "0020") {
+        call.set_rgb(0, 1, 0);
+        call.perform();
+        return std::string("AC Charge");
       }
       if (x == "0040") {
         call.set_rgb(0, 0, 1);
         call.perform();
-        return std::string("Battery/Off-Grid Mode");
+        return std::string("Battery Off-Grid");
+      }
+      if (x == "0080") {
+        call.set_rgb(0, 0, 1);
+        call.perform();
+        return std::string("PV Off-Grid");
+      }
+      if (x == "0088") {
+        call.set_rgb(0, 0, 1);
+        call.perform();
+        return std::string("PV Charge Off-Grid");
       }
       return x;
+
+datetime:
+  # 6000XP AC Charge window 1 (holding 68=start, 69=end). These are
+  # read-backed time entities; changing either word is followed by a read of
+  # the complete pair so Home Assistant reflects what the inverter accepted.
+  - platform: template
+    type: time
+    name: "AC Charge Start Time 1"
+    id: ac_charge_start_time
+    entity_category: config
+    update_interval: never
+    lambda: |-
+      if (!id(ac_charge_time_valid)[0]) return {};
+      const uint16_t raw = id(ac_charge_time_shadow)[0];
+      const uint8_t hour = raw & 0xFF;
+      const uint8_t minute = raw >> 8;
+      if (hour > 23 || minute > 59) {
+        ESP_LOGW("charge_time", "Invalid register 68 value 0x%04X", raw);
+        return {};
+      }
+      ESPTime result{};
+      result.hour = hour;
+      result.minute = minute;
+      result.second = 0;
+      return result;
+    set_action:
+      - lambda: |-
+          if (!id(ac_charge_time_valid)[0] || !id(ac_charge_time_valid)[1]) {
+            ESP_LOGW("charge_time", "Ignored start-time change before window 1 was read");
+            return;
+          }
+          const uint16_t packed =
+            (uint16_t(x.minute) << 8) | uint16_t(x.hour);
+          id(ac_charge_time_shadow)[0] = packed;
+          const uint32_t generation = ++id(ac_charge_time_write_generation);
+          id(ac_charge_time_write_pending) = true;
+          id(ac_charge_time_pending_since) = 0;
+          id(ac_charge_start_time).update();
+
+          const bool allow_duplicates = inverter_1->get_allow_duplicate_commands();
+          inverter_1->set_allow_duplicate_commands(true);
+          auto write_cmd =
+            esphome::modbus_controller::ModbusCommandItem::create_write_single_command(
+              inverter_1, 68, packed);
+          write_cmd.on_data_func = [generation](
+              esphome::modbus::ModbusRegisterType register_type,
+              uint16_t start_address, const std::vector<uint8_t> &data) {
+            inverter_1->on_write_register_response(register_type, start_address, data);
+            if (generation == id(ac_charge_time_write_generation) &&
+                id(ac_charge_time_write_pending)) {
+              id(ac_charge_time_pending_since) = std::max<uint32_t>(1, millis());
+            }
+          };
+          auto verify_cmd =
+            esphome::modbus_controller::ModbusCommandItem::create_read_command(
+              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING, 68, 2,
+              [generation](esphome::modbus::ModbusRegisterType register_type,
+                           uint16_t start_address,
+                           const std::vector<uint8_t> &data) {
+                if (generation != id(ac_charge_time_write_generation)) return;
+                if (data.size() < 4) {
+                  ESP_LOGW("charge_time", "Short AC Charge time readback");
+                  return;
+                }
+                id(ac_charge_time_write_pending) = false;
+                inverter_1->on_register_data(register_type, start_address, data);
+              });
+          inverter_1->queue_command(write_cmd);
+          inverter_1->queue_command(verify_cmd);
+          inverter_1->set_allow_duplicate_commands(allow_duplicates);
+
+  - platform: template
+    type: time
+    name: "AC Charge End Time 1"
+    id: ac_charge_end_time
+    entity_category: config
+    update_interval: never
+    lambda: |-
+      if (!id(ac_charge_time_valid)[1]) return {};
+      const uint16_t raw = id(ac_charge_time_shadow)[1];
+      const uint8_t hour = raw & 0xFF;
+      const uint8_t minute = raw >> 8;
+      if (hour > 23 || minute > 59) {
+        ESP_LOGW("charge_time", "Invalid register 69 value 0x%04X", raw);
+        return {};
+      }
+      ESPTime result{};
+      result.hour = hour;
+      result.minute = minute;
+      result.second = 0;
+      return result;
+    set_action:
+      - lambda: |-
+          if (!id(ac_charge_time_valid)[0] || !id(ac_charge_time_valid)[1]) {
+            ESP_LOGW("charge_time", "Ignored end-time change before window 1 was read");
+            return;
+          }
+          const uint16_t packed =
+            (uint16_t(x.minute) << 8) | uint16_t(x.hour);
+          id(ac_charge_time_shadow)[1] = packed;
+          const uint32_t generation = ++id(ac_charge_time_write_generation);
+          id(ac_charge_time_write_pending) = true;
+          id(ac_charge_time_pending_since) = 0;
+          id(ac_charge_end_time).update();
+
+          const bool allow_duplicates = inverter_1->get_allow_duplicate_commands();
+          inverter_1->set_allow_duplicate_commands(true);
+          auto write_cmd =
+            esphome::modbus_controller::ModbusCommandItem::create_write_single_command(
+              inverter_1, 69, packed);
+          write_cmd.on_data_func = [generation](
+              esphome::modbus::ModbusRegisterType register_type,
+              uint16_t start_address, const std::vector<uint8_t> &data) {
+            inverter_1->on_write_register_response(register_type, start_address, data);
+            if (generation == id(ac_charge_time_write_generation) &&
+                id(ac_charge_time_write_pending)) {
+              id(ac_charge_time_pending_since) = std::max<uint32_t>(1, millis());
+            }
+          };
+          auto verify_cmd =
+            esphome::modbus_controller::ModbusCommandItem::create_read_command(
+              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING, 68, 2,
+              [generation](esphome::modbus::ModbusRegisterType register_type,
+                           uint16_t start_address,
+                           const std::vector<uint8_t> &data) {
+                if (generation != id(ac_charge_time_write_generation)) return;
+                if (data.size() < 4) {
+                  ESP_LOGW("charge_time", "Short AC Charge time readback");
+                  return;
+                }
+                id(ac_charge_time_write_pending) = false;
+                inverter_1->on_register_data(register_type, start_address, data);
+              });
+          inverter_1->queue_command(write_cmd);
+          inverter_1->queue_command(verify_cmd);
+          inverter_1->set_allow_duplicate_commands(allow_duplicates);
 
 time:
   - platform: sntp
@@ -545,6 +2012,9 @@ time:
     servers:
       - 10.6.10.5
       - 10.6.10.4
+    on_time_sync:
+      then:
+        - button.press: sync_time
     on_time:
       seconds: 0
       minutes: 0
@@ -552,6 +2022,51 @@ time:
         - button.press: sync_time
 
 button:
+
+  - platform: template
+    id: restore_saved_ac_first_window1
+    name: "Restore Saved AC First Window 1"
+    entity_category: config
+    icon: "mdi:backup-restore"
+    on_press:
+      then:
+        - lambda: |-
+            if (!id(ac_first_schedule_valid) ||
+                !id(ac_first_restore_available)) {
+              ESP_LOGW("ac_first", "No confirmed saved AC First window 1 to restore");
+              return;
+            }
+            const uint32_t generation = ++id(ac_first_write_generation);
+            id(ac_first_desired_on) = false;
+            id(ac_first_desired_start) = id(ac_first_saved_start);
+            id(ac_first_desired_end) = id(ac_first_saved_end);
+            id(ac_first_retry_count) = 0;
+            id(ac_first_write_pending) = true;
+            id(ac_first_pending_since) = 0;
+            id(ac_first).publish_state(false);
+            id(write_ac_first_schedule).execute(int(generation));
+
+  - platform: template
+    id: clear_ac_first_window1
+    name: "Clear AC First Window 1 Schedule"
+    entity_category: config
+    icon: "mdi:calendar-remove"
+    on_press:
+      then:
+        - lambda: |-
+            if (!id(ac_first_schedule_valid)) {
+              ESP_LOGW("ac_first", "Ignored clear before AC First window 1 was read");
+              return;
+            }
+            const uint32_t generation = ++id(ac_first_write_generation);
+            id(ac_first_desired_on) = false;
+            id(ac_first_desired_start) = 0x0000;
+            id(ac_first_desired_end) = 0x0000;
+            id(ac_first_retry_count) = 0;
+            id(ac_first_write_pending) = true;
+            id(ac_first_pending_since) = 0;
+            id(ac_first).publish_state(false);
+            id(write_ac_first_schedule).execute(int(generation));
 
   - platform: template
     id: sync_time
@@ -579,20 +2094,11 @@ button:
             esphome::modbus_controller::ModbusCommandItem cmd_sm =
               esphome::modbus_controller::ModbusCommandItem::create_write_single_command(inverter_1, 14, secondMinute);
 
+            // Keep all three words from the same captured timestamp. Normal
+            // duplicate suppression can otherwise mix two overlapping syncs.
+            const bool allow_duplicates = inverter_1->get_allow_duplicate_commands();
+            inverter_1->set_allow_duplicate_commands(true);
             inverter_1->queue_command(cmd_my);
             inverter_1->queue_command(cmd_hd);
             inverter_1->queue_command(cmd_sm);
-
-  # Writes 23:59 to holding reg 69 (charge stop time) to effectively disable the charge time window
-  - platform: template
-    id: set_chargestop_time
-    name: "Set Charge Time"
-    on_press:
-      then:
-        - lambda: |-
-            uint8_t hours = 23;
-            uint8_t minutes = 59;
-            uint16_t minuteshours = (minutes << 8) | hours;
-            esphome::modbus_controller::ModbusCommandItem cmd =
-              esphome::modbus_controller::ModbusCommandItem::create_write_single_command(inverter_1, 69, minuteshours);
-            inverter_1->queue_command(cmd);
+            inverter_1->set_allow_duplicate_commands(allow_duplicates);
