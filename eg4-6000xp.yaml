@@ -1,8 +1,8 @@
 esphome:
   name: 6000xp
   friendly_name: 6000xp
-  # This configuration uses the post-2026.7 Modbus controller queue API.
-  min_version: 2026.7.4
+  # This configuration uses the ESPHome 2026.8 Modbus client queue API.
+  min_version: 2026.8.0
   on_boot:
       then:
         - light.turn_on:
@@ -43,7 +43,7 @@ wifi:
 
 light:
   - platform: esp32_rmt_led_strip
-    rgb_order: GRB
+    channel_colors: GRB
     pin: GPIO04
     num_leds: 1
     chipset: ws2812
@@ -65,9 +65,8 @@ uart:
 modbus:
   - uart_id: uart_modbus_inverter_1
     id: modbus_inverter_1
-    # ESPHome 2026.7 increased these defaults to 2000ms/600ms. The inverter
-    # normally answers much faster; explicit conservative values keep writes
-    # from sitting behind the polling queue for several seconds.
+    # The inverter normally answers much faster than ESPHome's conservative
+    # default; explicit values keep writes from waiting several seconds.
     send_wait_time: 500ms
     turnaround_time: 200ms
 
@@ -76,7 +75,6 @@ modbus_controller:
     update_interval: 15s
     modbus_id: modbus_inverter_1
     id: inverter_1
-    command_throttle: 50ms
     max_cmd_retries: 2
     offline_skip_updates: 2
     on_offline:
@@ -88,10 +86,10 @@ modbus_controller:
             id(inverter_modbus_status).publish_state(
               str_sprintf("Offline: FC%d register %d", function_code, address));
 
-            // Queued commands are not removed when ESPHome declares the
-            // controller offline. Preserve their pending generations so a
-            // user command already in the queue can still finish and verify
-            // after recovery; only reject additional writes meanwhile.
+            // ESPHome 2026.8 retires this device's queued frames when it is
+            // declared offline. Keep the pending generations until the
+            // recovery read reconciles them; invalid shadows reject new
+            // writes meanwhile.
             id(reg120_shadow_valid) = false;
             id(ac_first_schedule_valid) = false;
 
@@ -312,15 +310,6 @@ binary_sensor:
 
 sensor:
 
-  - platform: template
-    name: "Inverter Modbus Queue Length"
-    id: inverter_modbus_queue_length
-    entity_category: diagnostic
-    icon: "mdi:format-list-numbered"
-    accuracy_decimals: 0
-    update_interval: 5s
-    lambda: |-
-      return (float) inverter_1->get_command_queue_length();
 
   # Raw register 120 mirror and confirmed source for the shared local shadow
   # Using sensor (not number) so HA cannot accidentally write to it
@@ -956,14 +945,13 @@ sensor:
 script:
   # Snapshot and enqueue recovery in the same event-loop turn as on_online, so
   # a new HA write cannot be accepted between generation capture and queueing.
-  # Duplicate allowance safely puts the reads behind the recovering front
-  # command. Single mode plus the final delay bounds batches on a flapping link.
+  # ESPHome's 2026.8 hub gives these one-shot reads their own identities and
+  # orders them behind writes. Single mode plus the final delay bounds batches
+  # on a flapping link.
   - id: refresh_inverter_state
     mode: single
     then:
       - lambda: |-
-          const bool allow_duplicates = inverter_1->get_allow_duplicate_commands();
-          inverter_1->set_allow_duplicate_commands(true);
           const uint32_t reg120_generation = id(reg120_write_generation);
           const uint32_t charge_time_generation = id(ac_charge_time_write_generation);
           const uint32_t ac_first_generation = id(ac_first_write_generation);
@@ -971,74 +959,75 @@ script:
 
           auto reg120_cmd =
             esphome::modbus_controller::ModbusCommandItem::create_read_command(
-              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING, 120, 1,
-              [reg120_generation](esphome::modbus::ModbusRegisterType register_type,
-                                  uint16_t start_address,
-                                  const std::vector<uint8_t> &data) {
+              inverter_1, esphome::modbus::EntityType::HOLDING, 120, 1,
+              [reg120_generation](esphome::modbus::EntityType,
+                                  uint16_t, std::span<const uint8_t> data) {
                 if (data.size() < 2) return;
                 if (reg120_generation == id(reg120_write_generation)) {
                   id(reg120_write_pending) = false;
                 }
-                inverter_1->on_register_data(register_type, start_address, data);
+                id(reg120).parse_and_publish(data);
               });
           auto battery_cmd =
             esphome::modbus_controller::ModbusCommandItem::create_read_command(
-              inverter_1, esphome::modbus::ModbusRegisterType::INPUT_REGISTER, 4, 2);
+              inverter_1, esphome::modbus::EntityType::INPUT_REGISTER, 4, 2,
+              [](esphome::modbus::EntityType, uint16_t,
+                 std::span<const uint8_t> data) {
+                if (data.size() < 4) return;
+                id(vbat).parse_and_publish(data);
+                id(bat_soc).parse_and_publish(data);
+              });
 
           auto charge_time_cmd =
             esphome::modbus_controller::ModbusCommandItem::create_read_command(
-              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING, 68, 2,
-              [charge_time_generation](esphome::modbus::ModbusRegisterType register_type,
-                                       uint16_t start_address,
-                                       const std::vector<uint8_t> &data) {
+              inverter_1, esphome::modbus::EntityType::HOLDING, 68, 2,
+              [charge_time_generation](esphome::modbus::EntityType,
+                                       uint16_t, std::span<const uint8_t> data) {
                 if (data.size() < 4) return;
                 if (charge_time_generation == id(ac_charge_time_write_generation)) {
                   id(ac_charge_time_write_pending) = false;
                 }
-                inverter_1->on_register_data(register_type, start_address, data);
+                id(ac_charge_start_time_raw).parse_and_publish(data);
+                id(ac_charge_end_time_raw).parse_and_publish(data);
               });
           auto eod_cmd =
             esphome::modbus_controller::ModbusCommandItem::create_read_command(
-              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING, 105, 1,
-              [config_generations](esphome::modbus::ModbusRegisterType register_type,
-                                   uint16_t start_address,
-                                   const std::vector<uint8_t> &data) {
+              inverter_1, esphome::modbus::EntityType::HOLDING, 105, 1,
+              [config_generations](esphome::modbus::EntityType,
+                                   uint16_t, std::span<const uint8_t> data) {
                 if (data.size() < 2) return;
                 if (config_generations[0] == id(config_write_generation)[0]) {
                   id(config_write_pending)[0] = false;
                 }
-                inverter_1->on_register_data(register_type, start_address, data);
+                id(on_grid_eod_soc_raw).parse_and_publish(data);
               });
           auto cutoff_cmd =
             esphome::modbus_controller::ModbusCommandItem::create_read_command(
-              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING, 125, 1,
-              [config_generations](esphome::modbus::ModbusRegisterType register_type,
-                                   uint16_t start_address,
-                                   const std::vector<uint8_t> &data) {
+              inverter_1, esphome::modbus::EntityType::HOLDING, 125, 1,
+              [config_generations](esphome::modbus::EntityType,
+                                   uint16_t, std::span<const uint8_t> data) {
                 if (data.size() < 2) return;
                 if (config_generations[1] == id(config_write_generation)[1]) {
                   id(config_write_pending)[1] = false;
                 }
-                inverter_1->on_register_data(register_type, start_address, data);
+                id(discharge_cutoff_soc_raw).parse_and_publish(data);
               });
           auto ac_first_cmd =
             esphome::modbus_controller::ModbusCommandItem::create_read_command(
-              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING, 152, 2,
-              [ac_first_generation](esphome::modbus::ModbusRegisterType register_type,
-                                    uint16_t start_address,
-                                    const std::vector<uint8_t> &data) {
+              inverter_1, esphome::modbus::EntityType::HOLDING, 152, 2,
+              [ac_first_generation](esphome::modbus::EntityType,
+                                    uint16_t, std::span<const uint8_t> data) {
                 if (data.size() < 4) return;
                 if (ac_first_generation != id(ac_first_write_generation)) return;
                 id(ac_first_verification_dispatch) = true;
-                inverter_1->on_register_data(register_type, start_address, data);
+                id(ac_first_schedule_raw).parse_and_publish(data);
                 id(ac_first_verification_dispatch) = false;
               });
           auto ac_charge_soc_cmd =
             esphome::modbus_controller::ModbusCommandItem::create_read_command(
-              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING, 160, 2,
-              [config_generations](esphome::modbus::ModbusRegisterType register_type,
-                                   uint16_t start_address,
-                                   const std::vector<uint8_t> &data) {
+              inverter_1, esphome::modbus::EntityType::HOLDING, 160, 2,
+              [config_generations](esphome::modbus::EntityType,
+                                   uint16_t, std::span<const uint8_t> data) {
                 if (data.size() < 4) return;
                 if (config_generations[2] == id(config_write_generation)[2]) {
                   id(config_write_pending)[2] = false;
@@ -1046,26 +1035,25 @@ script:
                 if (config_generations[3] == id(config_write_generation)[3]) {
                   id(config_write_pending)[3] = false;
                 }
-                inverter_1->on_register_data(register_type, start_address, data);
+                id(ac_charge_start_raw).parse_and_publish(data);
+                id(ac_charge_stop_raw).parse_and_publish(data);
               });
           auto ac_current_cmd =
             esphome::modbus_controller::ModbusCommandItem::create_read_command(
-              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING, 168, 1,
-              [config_generations](esphome::modbus::ModbusRegisterType register_type,
-                                   uint16_t start_address,
-                                   const std::vector<uint8_t> &data) {
+              inverter_1, esphome::modbus::EntityType::HOLDING, 168, 1,
+              [config_generations](esphome::modbus::EntityType,
+                                   uint16_t, std::span<const uint8_t> data) {
                 if (data.size() < 2) return;
                 if (config_generations[4] == id(config_write_generation)[4]) {
                   id(config_write_pending)[4] = false;
                 }
-                inverter_1->on_register_data(register_type, start_address, data);
+                id(ac_charge_cur_raw).parse_and_publish(data);
               });
           auto ac_couple_soc_cmd =
             esphome::modbus_controller::ModbusCommandItem::create_read_command(
-              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING, 220, 2,
-              [config_generations](esphome::modbus::ModbusRegisterType register_type,
-                                   uint16_t start_address,
-                                   const std::vector<uint8_t> &data) {
+              inverter_1, esphome::modbus::EntityType::HOLDING, 220, 2,
+              [config_generations](esphome::modbus::EntityType,
+                                   uint16_t, std::span<const uint8_t> data) {
                 if (data.size() < 4) return;
                 if (config_generations[5] == id(config_write_generation)[5]) {
                   id(config_write_pending)[5] = false;
@@ -1073,19 +1061,19 @@ script:
                 if (config_generations[6] == id(config_write_generation)[6]) {
                   id(config_write_pending)[6] = false;
                 }
-                inverter_1->on_register_data(register_type, start_address, data);
+                id(ac_couple_start_soc_raw).parse_and_publish(data);
+                id(ac_couple_end_soc_raw).parse_and_publish(data);
               });
 
-          inverter_1->queue_command(reg120_cmd);
-          inverter_1->queue_command(battery_cmd);
-          inverter_1->queue_command(charge_time_cmd);
-          inverter_1->queue_command(eod_cmd);
-          inverter_1->queue_command(cutoff_cmd);
-          inverter_1->queue_command(ac_first_cmd);
-          inverter_1->queue_command(ac_charge_soc_cmd);
-          inverter_1->queue_command(ac_current_cmd);
-          inverter_1->queue_command(ac_couple_soc_cmd);
-          inverter_1->set_allow_duplicate_commands(allow_duplicates);
+          inverter_1->queue_command(std::move(reg120_cmd));
+          inverter_1->queue_command(std::move(battery_cmd));
+          inverter_1->queue_command(std::move(charge_time_cmd));
+          inverter_1->queue_command(std::move(eod_cmd));
+          inverter_1->queue_command(std::move(cutoff_cmd));
+          inverter_1->queue_command(std::move(ac_first_cmd));
+          inverter_1->queue_command(std::move(ac_charge_soc_cmd));
+          inverter_1->queue_command(std::move(ac_current_cmd));
+          inverter_1->queue_command(std::move(ac_couple_soc_cmd));
       - delay: 30s
 
   # AC First window 1 uses two proven FC06 writes. If one word is rejected,
@@ -1102,8 +1090,6 @@ script:
 
           const uint16_t start_time = id(ac_first_desired_start);
           const uint16_t end_time = id(ac_first_desired_end);
-          const bool allow_duplicates = inverter_1->get_allow_duplicate_commands();
-          inverter_1->set_allow_duplicate_commands(true);
 
           auto start_cmd =
             esphome::modbus_controller::ModbusCommandItem::create_write_single_command(
@@ -1112,8 +1098,8 @@ script:
             esphome::modbus_controller::ModbusCommandItem::create_write_single_command(
               inverter_1, 153, end_time);
           start_cmd.on_data_func = [generation](
-              esphome::modbus::ModbusRegisterType register_type,
-              uint16_t start_address, const std::vector<uint8_t> &data) {
+              esphome::modbus::EntityType register_type,
+              uint16_t start_address, std::span<const uint8_t> data) {
             inverter_1->on_write_register_response(register_type, start_address, data);
             if (uint32_t(generation) == id(ac_first_write_generation) &&
                 id(ac_first_write_pending)) {
@@ -1121,8 +1107,8 @@ script:
             }
           };
           end_cmd.on_data_func = [generation](
-              esphome::modbus::ModbusRegisterType register_type,
-              uint16_t start_address, const std::vector<uint8_t> &data) {
+              esphome::modbus::EntityType register_type,
+              uint16_t start_address, std::span<const uint8_t> data) {
             inverter_1->on_write_register_response(register_type, start_address, data);
             if (uint32_t(generation) == id(ac_first_write_generation) &&
                 id(ac_first_write_pending)) {
@@ -1131,24 +1117,22 @@ script:
           };
           auto verify_cmd =
             esphome::modbus_controller::ModbusCommandItem::create_read_command(
-              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING, 152, 2,
-              [generation](esphome::modbus::ModbusRegisterType register_type,
-                           uint16_t start_address,
-                           const std::vector<uint8_t> &data) {
+              inverter_1, esphome::modbus::EntityType::HOLDING, 152, 2,
+              [generation](esphome::modbus::EntityType,
+                           uint16_t, std::span<const uint8_t> data) {
                 if (uint32_t(generation) != id(ac_first_write_generation)) return;
                 if (data.size() < 4) {
                   ESP_LOGW("ac_first", "Short AC First readback");
                   return;
                 }
                 id(ac_first_verification_dispatch) = true;
-                inverter_1->on_register_data(register_type, start_address, data);
+                id(ac_first_schedule_raw).parse_and_publish(data);
                 id(ac_first_verification_dispatch) = false;
               });
 
-          inverter_1->queue_command(start_cmd);
-          inverter_1->queue_command(end_cmd);
-          inverter_1->queue_command(verify_cmd);
-          inverter_1->set_allow_duplicate_commands(allow_duplicates);
+          inverter_1->queue_command(std::move(start_cmd));
+          inverter_1->queue_command(std::move(end_cmd));
+          inverter_1->queue_command(std::move(verify_cmd));
 
   # Enforce the optional high-SOC policy every time either input changes. The
   # 6000XP has three modes that include a time condition: Time, Voltage+Time,
@@ -1195,15 +1179,12 @@ script:
             return;
           }
 
-          const bool allow_duplicates = inverter_1->get_allow_duplicate_commands();
-          inverter_1->set_allow_duplicate_commands(true);
-
           auto write_cmd =
             esphome::modbus_controller::ModbusCommandItem::create_write_single_command(
               inverter_1, uint16_t(address), uint16_t(value));
           write_cmd.on_data_func = [slot, generation](
-              esphome::modbus::ModbusRegisterType register_type,
-              uint16_t start_address, const std::vector<uint8_t> &data) {
+              esphome::modbus::EntityType register_type,
+              uint16_t start_address, std::span<const uint8_t> data) {
             inverter_1->on_write_register_response(register_type, start_address, data);
             if (slot >= 0 && slot < 7 &&
                 uint32_t(generation) == id(config_write_generation)[slot] &&
@@ -1213,12 +1194,11 @@ script:
           };
           auto verify_cmd =
             esphome::modbus_controller::ModbusCommandItem::create_read_command(
-              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING,
+              inverter_1, esphome::modbus::EntityType::HOLDING,
               uint16_t(verify_address), uint16_t(verify_count),
-              [slot, generation, verify_count](
-                esphome::modbus::ModbusRegisterType register_type,
-                uint16_t start_address,
-                const std::vector<uint8_t> &data) {
+              [slot, generation, verify_address, verify_count](
+                esphome::modbus::EntityType, uint16_t,
+                std::span<const uint8_t> data) {
                   if (slot < 0 || slot >= 7 ||
                       uint32_t(generation) != id(config_write_generation)[slot]) return;
                   if (data.size() < size_t(verify_count) * 2U) {
@@ -1226,12 +1206,32 @@ script:
                     return;
                   }
                   id(config_write_pending)[slot] = false;
-                  inverter_1->on_register_data(register_type, start_address, data);
+                  switch (verify_address) {
+                    case 105:
+                      id(on_grid_eod_soc_raw).parse_and_publish(data);
+                      break;
+                    case 125:
+                      id(discharge_cutoff_soc_raw).parse_and_publish(data);
+                      break;
+                    case 160:
+                      id(ac_charge_start_raw).parse_and_publish(data);
+                      id(ac_charge_stop_raw).parse_and_publish(data);
+                      break;
+                    case 168:
+                      id(ac_charge_cur_raw).parse_and_publish(data);
+                      break;
+                    case 220:
+                      id(ac_couple_start_soc_raw).parse_and_publish(data);
+                      id(ac_couple_end_soc_raw).parse_and_publish(data);
+                      break;
+                    default:
+                      ESP_LOGW("settings", "Unexpected verify address %d", verify_address);
+                      break;
+                  }
                 });
 
-          inverter_1->queue_command(write_cmd);
-          inverter_1->queue_command(verify_cmd);
-          inverter_1->set_allow_duplicate_commands(allow_duplicates);
+          inverter_1->queue_command(std::move(write_cmd));
+          inverter_1->queue_command(std::move(verify_cmd));
 
   - id: write_reg120
     mode: restart
@@ -1249,15 +1249,12 @@ script:
           const uint16_t desired = id(reg120_shadow);
           const uint32_t generation = id(reg120_write_generation);
 
-          const bool allow_duplicates = inverter_1->get_allow_duplicate_commands();
-          inverter_1->set_allow_duplicate_commands(true);
-
           auto write_cmd =
             esphome::modbus_controller::ModbusCommandItem::create_write_single_command(
               inverter_1, 120, desired);
           write_cmd.on_data_func = [generation](
-              esphome::modbus::ModbusRegisterType register_type,
-              uint16_t start_address, const std::vector<uint8_t> &data) {
+              esphome::modbus::EntityType register_type,
+              uint16_t start_address, std::span<const uint8_t> data) {
             inverter_1->on_write_register_response(register_type, start_address, data);
             if (generation == id(reg120_write_generation) &&
                 id(reg120_write_pending)) {
@@ -1266,21 +1263,23 @@ script:
           };
           auto verify_cmd =
             esphome::modbus_controller::ModbusCommandItem::create_read_command(
-              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING, 120, 1,
-              [generation](esphome::modbus::ModbusRegisterType register_type,
-                           uint16_t start_address,
-                           const std::vector<uint8_t> &data) {
+              inverter_1, esphome::modbus::EntityType::HOLDING, 120, 1,
+              [generation](esphome::modbus::EntityType,
+                           uint16_t, std::span<const uint8_t> data) {
                 // A later desired value supersedes this readback.
                 if (generation != id(reg120_write_generation)) return;
+                if (data.size() < 2) {
+                  ESP_LOGW("reg120", "Short register 120 readback");
+                  return;
+                }
                 id(reg120_write_pending) = false;
                 id(reg120_verification_dispatch) = true;
-                inverter_1->on_register_data(register_type, start_address, data);
+                id(reg120).parse_and_publish(data);
                 id(reg120_verification_dispatch) = false;
               });
 
-          inverter_1->queue_command(write_cmd);
-          inverter_1->queue_command(verify_cmd);
-          inverter_1->set_allow_duplicate_commands(allow_duplicates);
+          inverter_1->queue_command(std::move(write_cmd));
+          inverter_1->queue_command(std::move(verify_cmd));
 
           ESP_LOGD("reg120", "Queued generation=%u value=%u",
                    (unsigned) generation, (unsigned) desired);
@@ -1781,6 +1780,17 @@ number:
 
 text_sensor:
 
+  - platform: uptime
+    name: "Uptime"
+    icon: mdi:clock-outline
+    entity_category: diagnostic
+    update_interval: 60s
+    format:
+      separator: " "
+      days: "d"
+      hours: "h"
+      minutes: "m"
+
   - platform: template
     name: "Inverter Modbus Status"
     id: inverter_modbus_status
@@ -1907,14 +1917,12 @@ datetime:
           id(ac_charge_time_pending_since) = 0;
           id(ac_charge_start_time).update();
 
-          const bool allow_duplicates = inverter_1->get_allow_duplicate_commands();
-          inverter_1->set_allow_duplicate_commands(true);
           auto write_cmd =
             esphome::modbus_controller::ModbusCommandItem::create_write_single_command(
               inverter_1, 68, packed);
           write_cmd.on_data_func = [generation](
-              esphome::modbus::ModbusRegisterType register_type,
-              uint16_t start_address, const std::vector<uint8_t> &data) {
+              esphome::modbus::EntityType register_type,
+              uint16_t start_address, std::span<const uint8_t> data) {
             inverter_1->on_write_register_response(register_type, start_address, data);
             if (generation == id(ac_charge_time_write_generation) &&
                 id(ac_charge_time_write_pending)) {
@@ -1923,21 +1931,20 @@ datetime:
           };
           auto verify_cmd =
             esphome::modbus_controller::ModbusCommandItem::create_read_command(
-              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING, 68, 2,
-              [generation](esphome::modbus::ModbusRegisterType register_type,
-                           uint16_t start_address,
-                           const std::vector<uint8_t> &data) {
+              inverter_1, esphome::modbus::EntityType::HOLDING, 68, 2,
+              [generation](esphome::modbus::EntityType,
+                           uint16_t, std::span<const uint8_t> data) {
                 if (generation != id(ac_charge_time_write_generation)) return;
                 if (data.size() < 4) {
                   ESP_LOGW("charge_time", "Short AC Charge time readback");
                   return;
                 }
                 id(ac_charge_time_write_pending) = false;
-                inverter_1->on_register_data(register_type, start_address, data);
+                id(ac_charge_start_time_raw).parse_and_publish(data);
+                id(ac_charge_end_time_raw).parse_and_publish(data);
               });
-          inverter_1->queue_command(write_cmd);
-          inverter_1->queue_command(verify_cmd);
-          inverter_1->set_allow_duplicate_commands(allow_duplicates);
+          inverter_1->queue_command(std::move(write_cmd));
+          inverter_1->queue_command(std::move(verify_cmd));
 
   - platform: template
     type: time
@@ -1973,14 +1980,12 @@ datetime:
           id(ac_charge_time_pending_since) = 0;
           id(ac_charge_end_time).update();
 
-          const bool allow_duplicates = inverter_1->get_allow_duplicate_commands();
-          inverter_1->set_allow_duplicate_commands(true);
           auto write_cmd =
             esphome::modbus_controller::ModbusCommandItem::create_write_single_command(
               inverter_1, 69, packed);
           write_cmd.on_data_func = [generation](
-              esphome::modbus::ModbusRegisterType register_type,
-              uint16_t start_address, const std::vector<uint8_t> &data) {
+              esphome::modbus::EntityType register_type,
+              uint16_t start_address, std::span<const uint8_t> data) {
             inverter_1->on_write_register_response(register_type, start_address, data);
             if (generation == id(ac_charge_time_write_generation) &&
                 id(ac_charge_time_write_pending)) {
@@ -1989,21 +1994,20 @@ datetime:
           };
           auto verify_cmd =
             esphome::modbus_controller::ModbusCommandItem::create_read_command(
-              inverter_1, esphome::modbus::ModbusRegisterType::HOLDING, 68, 2,
-              [generation](esphome::modbus::ModbusRegisterType register_type,
-                           uint16_t start_address,
-                           const std::vector<uint8_t> &data) {
+              inverter_1, esphome::modbus::EntityType::HOLDING, 68, 2,
+              [generation](esphome::modbus::EntityType,
+                           uint16_t, std::span<const uint8_t> data) {
                 if (generation != id(ac_charge_time_write_generation)) return;
                 if (data.size() < 4) {
                   ESP_LOGW("charge_time", "Short AC Charge time readback");
                   return;
                 }
                 id(ac_charge_time_write_pending) = false;
-                inverter_1->on_register_data(register_type, start_address, data);
+                id(ac_charge_start_time_raw).parse_and_publish(data);
+                id(ac_charge_end_time_raw).parse_and_publish(data);
               });
-          inverter_1->queue_command(write_cmd);
-          inverter_1->queue_command(verify_cmd);
-          inverter_1->set_allow_duplicate_commands(allow_duplicates);
+          inverter_1->queue_command(std::move(write_cmd));
+          inverter_1->queue_command(std::move(verify_cmd));
 
 time:
   - platform: sntp
@@ -2094,11 +2098,8 @@ button:
             esphome::modbus_controller::ModbusCommandItem cmd_sm =
               esphome::modbus_controller::ModbusCommandItem::create_write_single_command(inverter_1, 14, secondMinute);
 
-            // Keep all three words from the same captured timestamp. Normal
-            // duplicate suppression can otherwise mix two overlapping syncs.
-            const bool allow_duplicates = inverter_1->get_allow_duplicate_commands();
-            inverter_1->set_allow_duplicate_commands(true);
-            inverter_1->queue_command(cmd_my);
-            inverter_1->queue_command(cmd_hd);
-            inverter_1->queue_command(cmd_sm);
-            inverter_1->set_allow_duplicate_commands(allow_duplicates);
+            // Keep all three words from the same captured timestamp. Each
+            // one-shot write has its own 2026.8 queue identity.
+            inverter_1->queue_command(std::move(cmd_my));
+            inverter_1->queue_command(std::move(cmd_hd));
+            inverter_1->queue_command(std::move(cmd_sm));
