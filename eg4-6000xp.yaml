@@ -656,8 +656,8 @@ sensor:
     id: ac_first_schedule_raw
     register_type: holding
     address: 152
-    register_count: 2
-    value_type: U_WORD
+    value_type: RAW
+    response_size: 4  # Read both schedule registers (152/153) for the lambda.
     internal: true
     lambda: |-
       const size_t offset = item->offset;
@@ -880,7 +880,6 @@ sensor:
     id: grid_volt
     register_type: read
     address: 12
-    register_count: 5   # spans 12-16; next sensor starts at 17
     unit_of_measurement: "V"
     accuracy_decimals: 2
     value_type: U_WORD
@@ -894,7 +893,7 @@ sensor:
     id: prec
     register_type: read
     address: 17
-    register_count: 7   # spans 17-23; next sensor starts at 24
+    reuse_previous_range: true  # Join across the gap after register 12.
     unit_of_measurement: "W"
     value_type: U_WORD
     state_class: measurement
@@ -905,7 +904,7 @@ sensor:
     id: eps_power
     register_type: read
     address: 24
-    register_count: 3   # spans 24-26; next sensor starts at 27
+    reuse_previous_range: true  # Join across the gap after register 17.
     unit_of_measurement: "W"
     value_type: U_WORD
     state_class: measurement
@@ -916,6 +915,7 @@ sensor:
     id: pinv
     register_type: read
     address: 27
+    reuse_previous_range: true  # Join across the gap after register 24.
     unit_of_measurement: "W"
     value_type: U_WORD
     state_class: measurement
